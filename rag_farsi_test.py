@@ -6,6 +6,7 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 import pickle
+from runtime_config import EMBEDDING_MODEL, embedding_device
 
 
 index = faiss.read_index("database/documents.index")
@@ -14,8 +15,8 @@ with open("database/documents.pkl", "rb") as file:
     chunks = pickle.load(file)
 
 model = SentenceTransformer(
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-    device="mps"
+    EMBEDDING_MODEL,
+    device=embedding_device()
 )
 
 questions = [

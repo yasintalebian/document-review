@@ -3,6 +3,7 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 import pickle
+from runtime_config import EMBEDDING_MODEL, embedding_device
 
 
 # ==========================================
@@ -27,7 +28,8 @@ with open(
 # ==========================================
 
 model = SentenceTransformer(
-    "sentence-transformers/all-MiniLM-L6-v2"
+    EMBEDDING_MODEL,
+    device=embedding_device()
 )
 
 

@@ -9,6 +9,7 @@ import faiss
 import numpy as np
 import os
 import pickle
+from runtime_config import EMBEDDING_MODEL, embedding_device
 
 
 # ==========================================
@@ -98,8 +99,8 @@ print("\nLoading embedding model...")
 
 # Multilingual model - much better for Persian documents
 embedding_model = SentenceTransformer(
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-    device="mps"
+    EMBEDDING_MODEL,
+    device=embedding_device()
 )
 
 

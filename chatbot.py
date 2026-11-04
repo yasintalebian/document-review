@@ -6,6 +6,7 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 import pickle
+from runtime_config import EMBEDDING_MODEL, embedding_device, transformers_device
 
 from transformers import pipeline
 
@@ -34,8 +35,8 @@ print("Loaded chunks:", len(chunks))
 # ==========================================
 
 embedding_model = SentenceTransformer(
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-    device="mps"
+    EMBEDDING_MODEL,
+    device=embedding_device()
 )
 
 
@@ -55,11 +56,13 @@ llm = None
 for model_name in LLM_MODELS:
 
     try:
+        pipeline_options = {"device": transformers_device()}
+        if embedding_device() != "cpu":
+            pipeline_options["dtype"] = "bfloat16"
         llm = pipeline(
             "text-generation",
             model=model_name,
-            dtype="bfloat16",
-            device="mps"
+            **pipeline_options
         )
         print(f"Loaded LLM: {model_name}")
         break
