@@ -1,0 +1,101 @@
+from sentence_transformers import SentenceTransformer
+
+import faiss
+import numpy as np
+import pickle
+
+
+# ==========================================
+# Load database
+# ==========================================
+
+index = faiss.read_index(
+    "database/documents.index"
+)
+
+
+with open(
+    "database/documents.pkl",
+    "rb"
+) as file:
+
+    chunks = pickle.load(file)
+
+
+# ==========================================
+# Load embedding model
+# ==========================================
+
+model = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+
+
+# ==========================================
+# Ask question
+# ==========================================
+
+question = input("\nQuestion: ")
+
+
+# ==========================================
+# Convert question to vector
+# ==========================================
+
+question_embedding = model.encode(
+    [question]
+)
+
+question_embedding = np.array(
+    question_embedding
+).astype("float32")
+
+
+# ==========================================
+# Search
+# ==========================================
+
+distances, results = index.search(
+    question_embedding,
+    k=3
+)
+
+
+# ==========================================
+# Show results
+# ==========================================
+
+print("\nRelevant documents:\n")
+
+
+for position, index_number in enumerate(results[0]):
+
+    chunk = chunks[index_number]
+
+    print(
+        f"Result {position + 1}"
+    )
+
+    print(
+        "Source:",
+        chunk["source"]
+    )
+
+    print(
+        "Page:",
+        chunk["page"]
+    )
+
+    print(
+        "Text:",
+        chunk["text"]
+    )
+
+    print(
+        "Distance:",
+        distances[0][position]
+    )
+
+    print(
+        "-------------------------"
+    )
