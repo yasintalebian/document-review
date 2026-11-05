@@ -21,6 +21,7 @@ from docx import Document
 
 from docx_tracked_changes import create_tracked_docx
 from llm_client import LLMClient, LLMConfigurationError, LLMRequestError
+from iso_review import ISOFinding, load_baseline, review_iso_document
 
 
 @dataclass(frozen=True)
@@ -105,7 +106,7 @@ def classify_against_corpus(client: LLMClient, text: str, references: list[Refer
     return _parse_json(client.complete(messages))
 
 
-def review_document(document_path: str | Path, corpus_dir: str | Path, output_path: str | Path, report_path: str | Path) -> dict:
+def review_document(document_path: str | Path, corpus_dir: str | Path, output_path: str | Path, report_path: str | Path, iso_baseline_path: str | Path | None = None) -> dict:
     references = load_reference_corpus(corpus_dir)
     candidate_paragraphs = read_paragraphs(document_path)
     findings: list[Finding] = []
@@ -117,6 +118,7 @@ def review_document(document_path: str | Path, corpus_dir: str | Path, output_pa
         configuration = str(exc)
 
     replacements: dict[int, tuple[str, str]] = {}
+    appended_insertions: list[str] = []
     for index, text in enumerate(candidate_paragraphs):
         if not text:
             continue
@@ -143,7 +145,22 @@ def review_document(document_path: str | Path, corpus_dir: str | Path, output_pa
             finding.rationale = "No lexically relevant approved paragraph was found."
         findings.append(finding)
 
-    create_tracked_docx(document_path, output_path, replacements)
+    iso_standard = None
+    iso_findings: list[ISOFinding] = []
+    if iso_baseline_path and Path(iso_baseline_path).exists():
+        iso_standard, requirements = load_baseline(str(iso_baseline_path))
+        iso_findings = review_iso_document(client, candidate_paragraphs, requirements)
+        for finding in iso_findings:
+            if finding.suggested_text and finding.status in {"gap", "partial"}:
+                if finding.target_paragraph is not None and 0 <= finding.target_paragraph < len(candidate_paragraphs):
+                    replacements[finding.target_paragraph] = (
+                        candidate_paragraphs[finding.target_paragraph],
+                        finding.suggested_text,
+                    )
+                else:
+                    appended_insertions.append(f"[{finding.reference_id} - {finding.title}] {finding.suggested_text}")
+
+    create_tracked_docx(document_path, output_path, replacements, appended_insertions=appended_insertions)
     report = {
         "document": str(document_path),
         "corpus": str(corpus_dir),
@@ -151,6 +168,8 @@ def review_document(document_path: str | Path, corpus_dir: str | Path, output_pa
         "configuration": configuration,
         "reference_count": len(references),
         "finding_count": len(findings),
+        "iso_standard": iso_standard,
+        "iso_findings": [asdict(finding) for finding in iso_findings],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "findings": [asdict(finding) for finding in findings],
     }
@@ -178,6 +197,7 @@ def main() -> None:
     review_parser.add_argument("--corpus", default="references")
     review_parser.add_argument("--output", default="artifacts/reviewed_with_track_changes.docx")
     review_parser.add_argument("--report", default="artifacts/consistency_report.json")
+    review_parser.add_argument("--iso-baseline", default="standards/iso27001_2022_baseline.example.json")
 
     promote_parser = subparsers.add_parser("promote")
     promote_parser.add_argument("--document", required=True, help="human-approved DOCX")
@@ -187,7 +207,7 @@ def main() -> None:
     if args.command == "promote":
         print(f"Promoted reference: {promote_document(args.document, args.corpus)}")
         return
-    report = review_document(args.document, args.corpus, args.output, args.report)
+    report = review_document(args.document, args.corpus, args.output, args.report, args.iso_baseline)
     print(f"Checked {report['finding_count']} paragraph(s) against {report['reference_count']} reference paragraph(s).")
     print(f"Tracked document: {args.output}")
     print(f"Consistency report: {args.report}")

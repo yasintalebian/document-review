@@ -1,0 +1,17 @@
+{
+  "standard": "ISO/IEC 27001:2022",
+  "source_note": "Review anchors only. Populate summaries from the organization's licensed copy and approved Statement of Applicability. This file does not reproduce the standard.",
+  "requirements": [
+    {"reference_id": "4", "title": "Context of the organization", "summary": "Document the ISMS context, relevant internal and external issues, interested parties, and scope.", "keywords": ["scope", "context", "interested parties", "ISMS"]},
+    {"reference_id": "5", "title": "Leadership", "summary": "Show leadership commitment, an information security policy, and defined responsibilities and authorities.", "keywords": ["leadership", "policy", "responsibility", "authority"]},
+    {"reference_id": "6", "title": "Planning", "summary": "Address information security risks and opportunities, objectives, and planned changes.", "keywords": ["risk", "objective", "planning", "change"]},
+    {"reference_id": "7", "title": "Support", "summary": "Provide resources, competence, awareness, communication, and controlled documented information.", "keywords": ["resource", "competence", "awareness", "communication", "documented information"]},
+    {"reference_id": "8", "title": "Operation", "summary": "Plan, implement, and control the processes used to operate the ISMS and manage information security risks.", "keywords": ["operation", "process", "risk treatment", "control"]},
+    {"reference_id": "9", "title": "Performance evaluation", "summary": "Define monitoring, measurement, analysis, evaluation, internal audit, and management review activities.", "keywords": ["monitoring", "measurement", "audit", "management review"]},
+    {"reference_id": "10", "title": "Improvement", "summary": "Manage nonconformities, corrective action, and continual improvement of the ISMS.", "keywords": ["nonconformity", "corrective action", "continual improvement"]},
+    {"reference_id": "A.5", "title": "Annex A organizational controls", "summary": "Review the applicable organizational controls selected in the approved Statement of Applicability.", "keywords": ["organization", "asset", "supplier", "incident", "continuity", "compliance"]},
+    {"reference_id": "A.6", "title": "Annex A people controls", "summary": "Review the applicable people-related controls selected in the approved Statement of Applicability.", "keywords": ["people", "employment", "awareness", "remote", "discipline"]},
+    {"reference_id": "A.7", "title": "Annex A physical controls", "summary": "Review the applicable physical and environmental controls selected in the approved Statement of Applicability.", "keywords": ["physical", "facility", "equipment", "environment"]},
+    {"reference_id": "A.8", "title": "Annex A technological controls", "summary": "Review the applicable technology controls selected in the approved Statement of Applicability.", "keywords": ["technology", "access", "cryptography", "backup", "logging", "monitoring", "network"]}
+  ]
+}

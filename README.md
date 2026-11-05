@@ -11,6 +11,8 @@
 - استفاده از API سازگار با OpenAI بدون قرار دادن credential در کد
 - حالت آفلاین برای تولید Track Changes بدون اتصال به مدل
 - نگهداری اسناد تأییدشده در پوشه مرجع برای کنترل تناقض بین اسناد
+- ارزیابی اولیه در برابر بندهای ۴ تا ۱۰ و خانواده‌های Annex A استاندارد ISO/IEC 27001:2022
+- افزودن پیشنهادهای کمبود به‌صورت Track Changes در انتهای سند
 
 ## نصب
 
@@ -42,6 +44,7 @@ POST {INTERNAL_LLM_BASE_URL}/chat/completions
 python corpus_review.py review \
   --document incoming/policy-candidate.docx \
   --corpus references \
+  --iso-baseline standards/iso27001_2022_baseline.example.json \
   --output artifacts/policy-review.docx \
   --report artifacts/policy-consistency.json
 ```
@@ -57,6 +60,8 @@ python corpus_review.py promote \
 ```
 
 فقط سندی که تأیید شده است باید promote شود. بنابراین سندهای بعدی در برابر آخرین نسخه‌های مورد قبول بررسی می‌شوند.
+
+برای ارزیابی سازمانی، فایل نمونه استاندارد را به `standards/iso27001_2022_baseline.json` کپی کنید و خلاصه الزامات مجاز و ارجاع‌های Statement of Applicability سازمان را در آن وارد کنید. Agent برای کمبودهای تشخیص‌داده‌شده پیشنهاد تولید می‌کند و آن‌ها را به‌صورت Track Changes به انتهای سند اضافه می‌کند.
 
 ## تست
 

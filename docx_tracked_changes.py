@@ -77,18 +77,30 @@ def append_deleted_paragraph(
     _revision(paragraph._p, "del", text, revision_id, author)
 
 
+def append_inserted_paragraph(
+    document: object,
+    text: str,
+    revision_id: int,
+    author: str = "ISMS Review Agent",
+) -> None:
+    paragraph = document.add_paragraph()
+    _revision(paragraph._p, "ins", text, revision_id, author)
+
+
 def create_tracked_docx(
     source_path: str | Path,
     output_path: str | Path,
     replacements: dict[int, tuple[str, str]],
     insertions: dict[int, str] | None = None,
     deletions: list[str] | None = None,
+    appended_insertions: list[str] | None = None,
 ) -> None:
     """Create a DOCX with proposed changes visibly marked for human review."""
 
     document = Document(str(source_path))
     insertions = insertions or {}
     deletions = deletions or []
+    appended_insertions = appended_insertions or []
     for index, (old_text, new_text) in replacements.items():
         if 0 <= index < len(document.paragraphs):
             replace_paragraph_with_revision(document.paragraphs[index], old_text, new_text, index * 2 + 1)
@@ -97,5 +109,7 @@ def create_tracked_docx(
             mark_inserted_paragraph(document.paragraphs[index], text, index * 2 + 1)
     for offset, text in enumerate(deletions):
         append_deleted_paragraph(document, text, 100000 + offset)
+    for offset, text in enumerate(appended_insertions):
+        append_inserted_paragraph(document, text, 200000 + offset)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     document.save(str(output_path))
