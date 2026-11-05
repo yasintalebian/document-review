@@ -6,6 +6,7 @@ __pycache__/
 venv/
 artifacts/
 *.log
+references/*.docx
 # Generated vector databases should be rebuilt in each environment.
 *.index
 *.pkl

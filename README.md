@@ -1,6 +1,6 @@
 # ISMS Document Review Agent
 
-این پروژه یک نمونه اولیه برای بازبینی کنترل‌شده نسخه‌های DOCX است. نسخه جدید با نسخه تأییدشده مقایسه می‌شود، تغییرات در یک فایل Word با Track Changes ثبت می‌شوند و برای هر تغییر یک گزارش JSON تولید می‌شود.
+این پروژه یک نمونه اولیه برای بازبینی یک سند DOCX در برابر مجموعه‌ای از اسناد تأییدشده ISMS است. هر بار فقط یک سند جدید وارد می‌شود، تناقض‌های آن با مرجع‌های قبلی پیدا می‌شوند، تغییرات پیشنهادی در یک فایل Word با Track Changes ثبت می‌شوند و نتیجه در یک گزارش JSON ذخیره می‌شود. مسیر اصلی این نیاز `corpus_review.py` است. `review_agent.py` مسیر قدیمی مقایسه دو نسخه از یک سند است.
 
 ## ویژگی‌ها
 
@@ -10,6 +10,7 @@
 - طبقه‌بندی اختیاری تغییرات با LLM داخلی شرکت
 - استفاده از API سازگار با OpenAI بدون قرار دادن credential در کد
 - حالت آفلاین برای تولید Track Changes بدون اتصال به مدل
+- نگهداری اسناد تأییدشده در پوشه مرجع برای کنترل تناقض بین اسناد
 
 ## نصب
 
@@ -35,17 +36,27 @@ export INTERNAL_LLM_API_KEY=
 POST {INTERNAL_LLM_BASE_URL}/chat/completions
 ```
 
-## اجرای بازبینی
+## اجرای بازبینی یک سند در برابر اسناد مرجع
 
 ```bash
-python review_agent.py \
-  --old samples/policy-approved.docx \
-  --new samples/policy-candidate.docx \
+python corpus_review.py review \
+  --document incoming/policy-candidate.docx \
+  --corpus references \
   --output artifacts/policy-review.docx \
-  --report artifacts/policy-review.json
+  --report artifacts/policy-consistency.json
 ```
 
 فایل DOCX خروجی برای بازبینی و قبول یا رد تغییرات در Word آماده است. متن پیشنهادی مدل به‌صورت خودکار وارد سند نمی‌شود و در گزارش JSON ثبت می‌شود تا تصمیم نهایی انسانی باقی بماند.
+
+بعد از بررسی انسانی و تأیید سند، آن را به مجموعه مرجع اضافه کنید:
+
+```bash
+python corpus_review.py promote \
+  --document approved/policy-final.docx \
+  --corpus references
+```
+
+فقط سندی که تأیید شده است باید promote شود. بنابراین سندهای بعدی در برابر آخرین نسخه‌های مورد قبول بررسی می‌شوند.
 
 ## تست
 
@@ -55,4 +66,4 @@ pytest -q
 
 ## وضعیت RAG موجود
 
-اسکریپت‌های اولیه `build_database.py` و `chatbot.py` برای آزمایش RAG روی PDF نگه داشته شده‌اند. آن‌ها هنوز به یکپارچه‌سازی کامل با Agent بازبینی متصل نیستند. برای استفاده سازمانی باید embedding ثابت، device قابل تنظیم، کنترل دسترسی، نسخه‌بندی سند، لاگ ممیزی و آستانه رد نتایج نامرتبط به آن‌ها اضافه شود.
+اسکریپت‌های اولیه `build_database.py` و `chatbot.py` برای آزمایش RAG روی PDF نگه داشته شده‌اند. مسیر اصلی کنترل تناقض اکنون `corpus_review.py` است. RAG قدیمی هنوز به کنترل دسترسی، نسخه‌بندی سند و لاگ ممیزی سازمانی متصل نیست.
