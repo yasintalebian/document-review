@@ -43,7 +43,7 @@ cd /opt/document-review/app
 برای محیط تست، یک commit یا tag مشخص را checkout کنید تا نسخه اجرایی قابل ردیابی باشد:
 
 ```bash
-sudo -u document-review git checkout b213aa9328709d6ef48e4a16aab1184441a2dcb0
+sudo -u document-review git checkout 5de7eeca704d7061770355b6de5fd3e1e6436ef7
 ```
 
 در محیطی که GitHub عمومی از آن قابل دسترسی نیست، سورس را از مسیر داخلی مورد تأیید شرکت منتقل کنید و hash commit را در گزارش استقرار ثبت کنید.
