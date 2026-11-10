@@ -19,7 +19,7 @@ from pathlib import Path
 
 from docx import Document
 
-from docx_tracked_changes import create_tracked_docx
+from docx_tracked_changes import create_tracked_docx, iter_paragraphs
 from llm_client import LLMClient, LLMConfigurationError, LLMRequestError
 from iso_review import ISOFinding, load_baseline, review_iso_document
 
@@ -43,7 +43,7 @@ class Finding:
 
 
 def read_paragraphs(path: str | Path) -> list[str]:
-    return [paragraph.text.strip() for paragraph in Document(str(path)).paragraphs]
+    return [paragraph.text.strip() for paragraph in iter_paragraphs(Document(str(path)))]
 
 
 def load_reference_corpus(directory: str | Path) -> list[ReferenceParagraph]:
@@ -56,8 +56,14 @@ def load_reference_corpus(directory: str | Path) -> list[ReferenceParagraph]:
     return references
 
 
+# Arabic code points that Persian keyboards and converted files often use in
+# place of the Persian letters, plus the zero-width non-joiner (می‌شود/میشود).
+_PERSIAN_NORMALIZATION = str.maketrans({"ي": "ی", "ى": "ی", "ك": "ک", "‌": ""})
+
+
 def _tokens(text: str) -> set[str]:
-    return {token for token in re.findall(r"[\wآ-ی]+", text.lower()) if len(token) > 1}
+    text = text.lower().translate(_PERSIAN_NORMALIZATION)
+    return {token for token in re.findall(r"[\wآ-ی]+", text) if len(token) > 1}
 
 
 def relevant_references(text: str, references: list[ReferenceParagraph], limit: int = 5) -> list[ReferenceParagraph]:
@@ -152,7 +158,14 @@ def review_document(document_path: str | Path, corpus_dir: str | Path, output_pa
         iso_findings = review_iso_document(client, candidate_paragraphs, requirements)
         for finding in iso_findings:
             if finding.suggested_text and finding.status in {"gap", "partial"}:
-                if finding.target_paragraph is not None and 0 <= finding.target_paragraph < len(candidate_paragraphs):
+                # A paragraph can hold only one tracked replacement.  If the
+                # corpus review already proposed one, append the ISO proposal
+                # instead of silently discarding the corpus proposal.
+                if (
+                    finding.target_paragraph is not None
+                    and 0 <= finding.target_paragraph < len(candidate_paragraphs)
+                    and finding.target_paragraph not in replacements
+                ):
                     replacements[finding.target_paragraph] = (
                         candidate_paragraphs[finding.target_paragraph],
                         finding.suggested_text,
