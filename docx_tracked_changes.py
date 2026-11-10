@@ -5,9 +5,34 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+from collections.abc import Iterator
+
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+
+
+def iter_paragraphs(container: object) -> Iterator[Paragraph]:
+    """Yield every paragraph in reading order, including table cells.
+
+    ``Document.paragraphs`` skips tables, so policy text kept in tables would
+    never be reviewed.  Every reader and writer must use this function so that
+    paragraph indices in reports and tracked changes refer to the same text.
+    Merged cells are visited once.
+    """
+    for block in container.iter_inner_content():
+        if isinstance(block, Table):
+            seen = set()
+            for row in block.rows:
+                for cell in row.cells:
+                    if cell._tc in seen:
+                        continue
+                    seen.add(cell._tc)
+                    yield from iter_paragraphs(cell)
+        else:
+            yield block
 
 
 def _run_text(parent: object, text: str, deleted: bool = False) -> None:
@@ -101,12 +126,13 @@ def create_tracked_docx(
     insertions = insertions or {}
     deletions = deletions or []
     appended_insertions = appended_insertions or []
+    paragraphs = list(iter_paragraphs(document))
     for index, (old_text, new_text) in replacements.items():
-        if 0 <= index < len(document.paragraphs):
-            replace_paragraph_with_revision(document.paragraphs[index], old_text, new_text, index * 2 + 1)
+        if 0 <= index < len(paragraphs):
+            replace_paragraph_with_revision(paragraphs[index], old_text, new_text, index * 2 + 1)
     for index, text in insertions.items():
-        if 0 <= index < len(document.paragraphs):
-            mark_inserted_paragraph(document.paragraphs[index], text, index * 2 + 1)
+        if 0 <= index < len(paragraphs):
+            mark_inserted_paragraph(paragraphs[index], text, index * 2 + 1)
     for offset, text in enumerate(deletions):
         append_deleted_paragraph(document, text, 100000 + offset)
     for offset, text in enumerate(appended_insertions):

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from docx import Document
 
-from docx_tracked_changes import create_tracked_docx
+from docx_tracked_changes import create_tracked_docx, iter_paragraphs
 from llm_client import LLMClient, LLMConfigurationError, LLMRequestError
 
 
@@ -29,7 +29,7 @@ class Change:
 
 
 def read_paragraphs(path: str | Path) -> list[str]:
-    return [paragraph.text for paragraph in Document(str(path)).paragraphs]
+    return [paragraph.text for paragraph in iter_paragraphs(Document(str(path)))]
 
 
 def compare_documents(old: list[str], new: list[str]) -> list[Change]:
