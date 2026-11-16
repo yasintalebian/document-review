@@ -43,6 +43,23 @@ def norm(s):
     return re.sub(r"[\s\u200c]+", " ", s.replace("ي", "ی").replace("ك", "ک")).strip()
 
 
+NUMBERING_RE = re.compile(r"^\s*[0-9۰-۹]+(?:[.\-][0-9۰-۹]+)*[.\-)]?[\s\t]+")
+BODY_START = 'هدف'
+
+
+def bare(s):
+    """Heading text without manual numbering such as '۱.' or '5-2'."""
+    return norm(NUMBERING_RE.sub('', s))
+
+
+SECTION_TITLES = {bare(t) for t in ('هدف','دامنه کاربرد','تعاریف','مسئولیت‌ها و وظایف',
+                                    'شرح خط‌مشی','الزامات عمومی','بازنگری')}
+
+
+def is_body_start(text):
+    return bare(text) == BODY_START
+
+
 def text_of(p):
     return "".join(p.xpath("./w:r/w:t/text()", namespaces=NS))
 
@@ -85,10 +102,12 @@ class Block:
 
 def safe_paragraph(p):
     # Do not flatten fields, drawings, links, equations, existing revisions or tabs.
-    allowed = {W+'pPr', W+'r', W+'proofErr'}
+    # Bookmarks/proofing marks are kept in place; lastRenderedPageBreak is only a
+    # layout cache that Word regenerates, so it is safe to drop from rewritten runs.
+    allowed = {W+'pPr', W+'r', W+'proofErr', W+'bookmarkStart', W+'bookmarkEnd'}
     if any(c.tag not in allowed for c in p): return False
     runs = p.findall(W+'r')
-    return all(all(c.tag in {W+'rPr', W+'t'} for c in r) for r in runs)
+    return all(all(c.tag in {W+'rPr', W+'t', W+'lastRenderedPageBreak'} for c in r) for r in runs)
 
 
 def blocks_from(root, page_map=None):
@@ -103,8 +122,8 @@ def blocks_from(root, page_map=None):
         style = p.find('w:pPr/w:pStyle', NS)
         style_name = style.get(W+'val','') if style is not None else ''
         heading = style_name.lower().startswith('heading') or p.find('w:pPr/w:outlineLvl', NS) is not None
-        number_heading = bool(re.match(r'^[0-9۰-۹]+(?:[.\-][0-9۰-۹]+)*[\s\t]+\S',text))
-        if heading or (number_heading and len(text)<100) or norm(text) in {'هدف','دامنه کاربرد','تعاریف','مسئولیت‌ها و وظایف','شرح خط‌مشی','الزامات عمومی','بازنگری'}: section = text
+        number_heading = bool(NUMBERING_RE.match(text)) and bool(bare(text))
+        if heading or (number_heading and len(text)<100) or bare(text) in SECTION_TITLES: section = text
         page_value = page if markers else None
         page_source = 'cached_layout_estimate' if markers else 'unavailable'
         if page_map is not None:
@@ -128,11 +147,10 @@ def date_edits(root, blocks, today):
         if b is None or not DATE_RE.search(b.text): return
         if not b.editable: raise ValueError(f'Date field {b.index} contains unsupported Word structures')
         after=DATE_RE.sub(lambda m: '' if clear else current_date_like(m.group(),today),b.text)
-        if clear: after=after.strip()
         edits[b.index]=(after,kind)
         found.add(kind)
     # Cover date must have an explicit date label, before body heading, outside tables.
-    body_start=next((b.index for b in blocks if norm(b.text)=='هدف'),len(blocks))
+    body_start=next((b.index for b in blocks if is_body_start(b.text)),len(blocks))
     for b in blocks:
         if b.index>=body_start: break
         if b.element.getparent().tag==W+'body' and re.match(r'^\s*تاریخ\s*[:：]',b.text):
@@ -169,26 +187,47 @@ def protected_tokens(text):
     return Counter(re.findall(r'[0-9۰-۹٠-٩]+|[A-Za-z][A-Za-z0-9_.:/@-]*',text))
 
 
-def parse_edits(raw, batch):
-    cleaned=raw.strip()
+def extract_json(raw):
+    """Parse the JSON object in a model reply, tolerating code fences or reasoning text."""
+    cleaned=re.sub(r'<think>.*?</think>','',raw or '',flags=re.S).strip()
     if cleaned.startswith('```'): cleaned=re.sub(r'^```(?:json)?\s*|\s*```$','',cleaned)
-    payload=json.loads(cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start,end=cleaned.find('{'),cleaned.rfind('}')
+        if start<0 or end<=start: raise
+        return json.loads(cleaned[start:end+1])
+
+
+def parse_edits(raw, batch):
+    """Return (accepted, rejected). A single bad suggestion never aborts the review."""
+    payload=extract_json(raw)
     if not isinstance(payload,dict) or not isinstance(payload.get('edits'),list):
         raise ValueError('LLM response must contain an edits array')
-    available={b.index:b for b in batch};result={}
+    available={b.index:b for b in batch};result={};rejected=[]
+    def reject(e, idx, why):
+        rejected.append({'paragraph':idx if type(idx) is int else None,'reason_rejected':why,
+                         'suggested_after':e.get('after') if isinstance(e,dict) and isinstance(e.get('after'),str) else None})
     for e in payload['edits']:
-        if not isinstance(e,dict): raise ValueError('Invalid edit object')
-        idx=e.get('paragraph_id'); b=available.get(idx) if type(idx) is int else None
-        if b is None or idx in result or e.get('before')!=b.text:
-            raise ValueError('LLM edit does not match the exact source paragraph')
+        if not isinstance(e,dict): reject(e,None,'ساختار پیشنهاد نامعتبر است');continue
+        idx=e.get('paragraph_id')
+        if isinstance(idx,str) and idx.strip().isdigit(): idx=int(idx)
+        b=available.get(idx) if type(idx) is int else None
+        if b is None: reject(e,idx,'شمارهٔ پاراگراف در این دسته وجود ندارد');continue
+        if idx in result: reject(e,idx,'برای این پاراگراف بیش از یک پیشنهاد داده شده');continue
+        before=e.get('before')
+        if before is not None and (not isinstance(before,str) or norm(before)!=norm(b.text)):
+            reject(e,idx,'متن «قبل» با متن پاراگراف سند مطابقت ندارد');continue
         after=e.get('after');reason=e.get('reason')
         if not isinstance(after,str) or not after.strip() or '\n' in after or '\r' in after:
-            raise ValueError('Invalid replacement paragraph')
-        if not isinstance(reason,str) or not reason.strip(): raise ValueError('Missing Persian explanation')
+            reject(e,idx,'متن جایگزین نامعتبر است');continue
+        if not isinstance(reason,str) or not reason.strip(): reason='اصلاح نگارشی'
         if protected_tokens(after)!=protected_tokens(b.text):
-            raise ValueError('Model attempted to change a number, code or Latin identifier')
-        if after!=b.text: result[idx]=(after,reason)
-    return result
+            reject(e,idx,'عدد، کد یا شناسهٔ لاتین تغییر کرده است');continue
+        if len(after)>len(b.text)*1.5+20:
+            reject(e,idx,'تغییر بیش از حد اصلاح نگارشی است');continue
+        if after!=b.text: result[idx]=(after,reason.strip())
+    return result,rejected
 
 
 def revise(p, before, after, revision_id, timestamp, whole_date=False):
@@ -247,7 +286,7 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
         missing={'cover_date','review_date','approval_date'}-found
         if strict_dates and missing:raise ValueError('Date fields could not be identified safely: '+', '.join(sorted(missing)))
         # Front matter ends at the first body heading; do not ask LLM to rewrite metadata.
-        start=next((b.index for b in blocks if norm(b.text)=='هدف'),0)
+        start=next((b.index for b in blocks if is_body_start(b.text)),0)
         candidates=[b for b in blocks if b.index>=start and b.editable and b.text.strip()
                     and b.index not in metadata and len(b.text.strip())>12
                     and not DATE_RE.search(b.text)]
@@ -258,10 +297,20 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
             if batch and size+len(b.text)>6000:batches.append(batch);batch=[];size=0
             batch.append(b);size+=len(b.text)
         if batch:batches.append(batch)
-        for batch in batches:
+        rejected=[];failed_batches=[]
+        for number,batch in enumerate(batches,1):
             messages=[{'role':'system','content':SYSTEM},{'role':'user','content':json.dumps(
                 {'document_code':source.stem,'paragraphs':[{'paragraph_id':b.index,'section':b.section,'text':b.text} for b in batch]},ensure_ascii=False)}]
-            edits.update(parse_edits(client.complete(messages),batch))
+            for attempt in (1,2):
+                try:
+                    accepted,bad=parse_edits(client.complete(messages),batch)
+                except (ValueError,json.JSONDecodeError) as exc:
+                    if attempt==2:
+                        failed_batches.append({'batch':number,'paragraphs':[b.index for b in batch],'error':str(exc)[:300]})
+                    continue
+                edits.update(accepted);rejected.extend(bad);break
+        if batches and len(failed_batches)==len(batches):
+            raise ValueError('No usable LLM response for any batch; nothing was written. '+failed_batches[0]['error'])
         reasons={'cover_date':'به‌روزرسانی تاریخ صفحهٔ عنوان','review_date':'به‌روزرسانی تاریخ بازنگری در شناسنامهٔ سند','approval_date':'خالی کردن تاریخ تصویب برای بازنگری جدید'}
         changes=[];rid=1
         for b in blocks:
@@ -270,7 +319,8 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
             elif b.index in edits:after,reason=edits[b.index];kind='editorial'
             else:continue
             if after==b.text:continue
-            rid=revise(b.element,b.text,after,rid,now.isoformat(),whole_date=kind!="editorial")
+            rid=revise(b.element,b.text,after,rid,now.isoformat(),
+                       whole_date=kind!="editorial" and len(DATE_RE.findall(b.text))==1)
             page_label=(str(b.page)+' (شمارهٔ ذخیره‌شده؛ نیازمند تأیید)') if b.page_source=='cached_layout_estimate' else (str(b.page) if b.page is not None else 'نامشخص؛ نیازمند صفحه‌بندی Word')
             section_label = {'cover_date':'صفحهٔ عنوان','review_date':'شناسنامهٔ سند','approval_date':'جدول تصویب'}.get(kind,b.section)
             changes.append({'paragraph':b.index,'clause':section_label,'page':b.page,'page_source':b.page_source,
@@ -313,10 +363,17 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
     if any(b.page_source!='verified_source_page_map' for b in blocks):warnings.append('شمارهٔ دقیق صفحه فقط با صفحه‌بندی Word و نگاشت تأییدشده قابل گزارش است؛ شماره‌های ذخیره‌شده ممکن است قدیمی باشند.')
     warnings.extend('فیلد تاریخ شناسایی نشد: '+k for k in sorted(missing))
     skipped=[b.index for b in blocks if b.text.strip() and not b.editable]
+    for f in failed_batches:
+        warnings.append(f"پاسخ مدل برای دستهٔ {f['batch']} (پاراگراف‌های {f['paragraphs'][0]+1} تا {f['paragraphs'][-1]+1}) قابل استفاده نبود؛ این بخش بازنگری نشد.")
+    if rejected:
+        warnings.append(f'{len(rejected)} پیشنهاد مدل به دلیل ناسازگاری با متن یا تغییر عدد/کد اعمال نشد؛ جزئیات در rejected_suggestions.')
+    if skipped:
+        warnings.append(f'{len(skipped)} پاراگراف به دلیل ساختار خاص Word (فیلد، لینک، تب، تصویر) بدون بررسی ماند.')
     report={'schema_version':'editorial-1','review_type':'editorial','document':{'title':source.stem,'filename':source.name},
         'created_at':now.isoformat(),'source_sha256':hashlib.sha256(source.read_bytes()).hexdigest(),
         'output_filename':source.name,'summary':{'findings_total':len(changes),'recommendation':'اصلاحات پیشنهادی را در Word با نمایش All Markup بررسی کنید.'},
         'findings':changes,'warnings':warnings,'skipped_paragraphs':skipped,'date_fields_found':sorted(found),
+        'rejected_suggestions':rejected,'failed_batches':failed_batches,
         'approval_date_note':'تاریخ تصویب در نمای نهایی خالی است؛ مقدار قبلی فقط در حذف ردیابی‌شده برای ممیزی باقی می‌ماند.'}
     (dest/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     lines=[f'گزارش بازنگری نگارشی: {source.name}',f'زمان: {now.isoformat()}',f'تعداد اصلاحات: {len(changes)}','']

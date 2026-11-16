@@ -66,15 +66,72 @@ class EditorialTests(unittest.TestCase):
         self.assertTrue(content.xpath('.//w:r[w:rPr/w:b]/w:t',namespaces=NS))
         entry=next(f for f in report['findings'] if f['kind']=='editorial')
         self.assertEqual(entry['clause'],'۵.۱ الزامات عمومی');self.assertEqual(entry['page_source'],'cached_layout_estimate')
-    def test_rejects_numeric_policy_change_without_output(self):
+    def test_numeric_policy_change_is_rejected_not_applied(self):
         class Bad(FakeClient):
             def complete(self,messages):return super().complete(messages).replace('حداقل 13 کاراکتر لازم است.", "reason"','حداقل 8 کاراکتر لازم است.", "reason"')
-        with self.assertRaises(ValueError):review(self.src,self.root/'out',Bad(),now=NOW)
-        self.assertFalse((self.root/'out'/self.src.name).exists())
-    def test_rejects_mismatched_source(self):
+        report=review(self.src,self.root/'out',Bad(),now=NOW)
+        text=accepted(xml(self.root/'out'/self.src.name))
+        self.assertIn('حداقل 13 کاراکتر',text);self.assertNotIn('حداقل 8',text)
+        self.assertEqual([f['kind'] for f in report['findings']].count('editorial'),0)
+        self.assertEqual(len(report['rejected_suggestions']),1)
+        self.assertIn('عدد',report['rejected_suggestions'][0]['reason_rejected'])
+    def test_mismatched_source_is_rejected_not_fatal(self):
         class Bad:
             def complete(self,messages):return json.dumps({'edits':[{'paragraph_id':999,'before':'x','after':'y','reason':'z'}]})
-        with self.assertRaises(ValueError):review(self.src,self.root/'out',Bad(),now=NOW)
+        report=review(self.src,self.root/'out',Bad(),now=NOW)
+        self.assertEqual(report['rejected_suggestions'][0]['paragraph'],999)
+        self.assertEqual(report['summary']['findings_total'],3)  # dates only
+    def test_one_bad_suggestion_does_not_block_good_ones(self):
+        class Mixed(FakeClient):
+            def complete(self,messages):
+                data=json.loads(super().complete(messages))
+                data['edits'].append({'paragraph_id':-5,'after':'x','reason':'y'})
+                return json.dumps(data,ensure_ascii=False)
+        report=review(self.src,self.root/'out',Mixed(),now=NOW)
+        self.assertIn('می‌باشد',accepted(xml(self.root/'out'/self.src.name)))
+        self.assertEqual(len(report['rejected_suggestions']),1)
+    def test_reasoning_text_and_retry_are_tolerated(self):
+        class Chatty(FakeClient):
+            calls=0
+            def complete(self,messages):
+                Chatty.calls+=1
+                if Chatty.calls==1:return 'not json at all'
+                return '<think>checking</think>\nHere you go:\n'+super().complete(messages)+'\nDone.'
+        report=review(self.src,self.root/'out',Chatty(),now=NOW)
+        self.assertEqual(Chatty.calls,2);self.assertEqual(report['failed_batches'],[])
+        self.assertIn('می‌باشد',accepted(xml(self.root/'out'/self.src.name)))
+    def test_no_usable_llm_reply_writes_nothing(self):
+        class Broken:
+            def complete(self,messages):return 'sorry'
+        with self.assertRaisesRegex(ValueError,'No usable LLM response'):review(self.src,self.root/'out',Broken(),now=NOW)
+        self.assertFalse((self.root/'out'/self.src.name).exists())
+    def test_bookmarks_and_rendered_page_breaks_stay_editable(self):
+        root=xml(self.src)
+        p=next(p for p in root.xpath('.//w:p',namespaces=NS) if 'ميباشد' in ''.join(p.xpath('.//w:t/text()',namespaces=NS)))
+        first_run=p.find(W+'r')
+        first_run.insert(1,etree.Element(W+'lastRenderedPageBreak'))
+        p.insert(list(p).index(first_run),etree.Element(W+'bookmarkStart',{W+'id':'7',W+'name':'_Toc1'}))
+        p.append(etree.Element(W+'bookmarkEnd',{W+'id':'7'}))
+        rewritten=self.root/'bm.docx'
+        with zipfile.ZipFile(self.src) as zin, zipfile.ZipFile(rewritten,'w') as zout:
+            for e in zin.infolist():
+                zout.writestr(e,etree.tostring(root) if e.filename=='word/document.xml' else zin.read(e.filename))
+        rewritten=rewritten.rename(self.root/'SMIA.RG.17.Ver2.05-bm.docx')
+        report=review(rewritten,self.root/'out',FakeClient(),now=NOW)
+        out=xml(self.root/'out'/rewritten.name)
+        self.assertIn('می‌باشد',accepted(out))
+        self.assertTrue(out.xpath('.//w:bookmarkStart[@w:name="_Toc1"]',namespaces=NS))
+        self.assertTrue(out.xpath('.//w:bookmarkEnd[@w:id="7"]',namespaces=NS))
+        self.assertNotIn(next(b for b in report['findings'] if b['kind']=='editorial')['paragraph'],report['skipped_paragraphs'])
+    def test_manually_numbered_headings_are_sections(self):
+        from editorial_review import blocks_from, bare
+        self.assertEqual(bare('۱. هدف'),'هدف');self.assertEqual(bare('5-2 الزامات عمومی'),'الزامات عمومی')
+        d=Document();d.add_paragraph('تاریخ:11/06/1404');d.add_paragraph('۱. هدف')
+        d.add_paragraph('۳) دامنه کاربرد');d.add_paragraph('این یک متن آزمایشی ميباشد و طولانی است.');d.save(self.src)
+        blocks=blocks_from(xml(self.src))
+        self.assertEqual(blocks[-1].section,'۳) دامنه کاربرد')
+        report=review(self.src,self.root/'out',FakeClient(),now=NOW,strict_dates=False)
+        self.assertIn('cover_date',report['date_fields_found'])
     def test_missing_dates_fail_before_llm(self):
         d=Document();d.add_paragraph('متن ساده');d.save(self.src)
         with self.assertRaisesRegex(ValueError,'Date fields'):review(self.src,self.root/'out',FakeClient(),now=NOW)
