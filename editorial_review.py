@@ -21,7 +21,8 @@ import zipfile
 from zoneinfo import ZoneInfo
 
 from lxml import etree
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMRequestError
+import sys
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 W = "{" + NS["w"] + "}"
@@ -33,10 +34,24 @@ Correct only spelling, grammar, punctuation, spacing, half-spaces and small clar
 Preserve meaning, all numbers, document codes, URLs, names, dates, roles, obligations,
 policy thresholds and approval statements. Do not assess standards, compliance or policy quality.
 Do not invent requirements or append new sections. Return ONLY JSON {"edits":[...]},
-where each item has paragraph_id, before (EXACT whole supplied paragraph), after (the
-corrected whole paragraph), reason (brief Persian explanation). Omit unchanged paragraphs.
+where each item has paragraph_id, after (the corrected whole paragraph) and reason
+(brief Persian explanation). Include ONLY paragraphs you actually change; most paragraphs
+need no change, so the list is usually short or empty. Do not repeat the original text.
 Do not edit headings, contents, metadata, date fields, code, or document identifiers.
-If uncertain, do not change it. All edits must stay inside their original paragraph.'''
+If uncertain, do not change it. All edits must stay inside their original paragraph.
+No explanations outside the JSON.'''
+
+
+def batch_chars():
+    """Characters of source text per LLM request (EDITORIAL_BATCH_CHARS, default 2500)."""
+    try:
+        return max(300, int(os.getenv('EDITORIAL_BATCH_CHARS', '2500')))
+    except ValueError:
+        return 2500
+
+
+def progress(message):
+    print(message, file=sys.stderr, flush=True)
 
 
 def norm(s):
@@ -291,25 +306,46 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
                     and b.index not in metadata and len(b.text.strip())>12
                     and not DATE_RE.search(b.text)]
         client=client or LLMClient.from_environment()
+        limit=batch_chars()
         edits={};batches=[];batch=[];size=0
         for b in candidates:
             if len(b.text)>12000:raise ValueError(f'Paragraph {b.index} is too long for safe editorial batching')
-            if batch and size+len(b.text)>6000:batches.append(batch);batch=[];size=0
+            if batch and size+len(b.text)>limit:batches.append(batch);batch=[];size=0
             batch.append(b);size+=len(b.text)
         if batch:batches.append(batch)
-        rejected=[];failed_batches=[]
-        for number,batch in enumerate(batches,1):
+        rejected=[];failed_batches=[];state={'ok':0,'llm_failures_in_a_row':0}
+        def ask(batch, label):
+            """Send one batch; on an LLM timeout/error split it in half instead of aborting."""
             messages=[{'role':'system','content':SYSTEM},{'role':'user','content':json.dumps(
                 {'document_code':source.stem,'paragraphs':[{'paragraph_id':b.index,'section':b.section,'text':b.text} for b in batch]},ensure_ascii=False)}]
             for attempt in (1,2):
                 try:
-                    accepted,bad=parse_edits(client.complete(messages),batch)
+                    reply=client.complete(messages)
+                except LLMRequestError as exc:
+                    if len(batch)>1:
+                        progress(f'{label}: no reply in time, splitting {len(batch)} paragraphs')
+                        half=len(batch)//2
+                        ask(batch[:half],label+'a');ask(batch[half:],label+'b');return
+                    state['llm_failures_in_a_row']+=1
+                    failed_batches.append({'batch':label,'paragraphs':[b.index for b in batch],'error':str(exc)[:300]})
+                    if state['llm_failures_in_a_row']>=3:
+                        raise ValueError('The LLM did not answer even single paragraphs three times in a row; '
+                                         'nothing was written. Increase INTERNAL_LLM_TIMEOUT_SECONDS. Last error: '+str(exc)[:200]) from exc
+                    return
+                try:
+                    accepted,bad=parse_edits(reply,batch)
                 except (ValueError,json.JSONDecodeError) as exc:
                     if attempt==2:
-                        failed_batches.append({'batch':number,'paragraphs':[b.index for b in batch],'error':str(exc)[:300]})
+                        failed_batches.append({'batch':label,'paragraphs':[b.index for b in batch],'error':str(exc)[:300]})
                     continue
-                edits.update(accepted);rejected.extend(bad);break
-        if batches and len(failed_batches)==len(batches):
+                state['ok']+=1;state['llm_failures_in_a_row']=0
+                edits.update(accepted);rejected.extend(bad)
+                progress(f'{label}: {len(batch)} paragraph(s), {len(accepted)} edit(s)')
+                return
+        progress(f'{len(candidates)} paragraph(s) in {len(batches)} LLM request(s), up to {limit} characters each')
+        for number,batch in enumerate(batches,1):
+            ask(batch,f'{number}/{len(batches)}')
+        if batches and not state['ok']:
             raise ValueError('No usable LLM response for any batch; nothing was written. '+failed_batches[0]['error'])
         reasons={'cover_date':'به‌روزرسانی تاریخ صفحهٔ عنوان','review_date':'به‌روزرسانی تاریخ بازنگری در شناسنامهٔ سند','approval_date':'خالی کردن تاریخ تصویب برای بازنگری جدید'}
         changes=[];rid=1

@@ -123,6 +123,48 @@ class EditorialTests(unittest.TestCase):
         self.assertTrue(out.xpath('.//w:bookmarkStart[@w:name="_Toc1"]',namespaces=NS))
         self.assertTrue(out.xpath('.//w:bookmarkEnd[@w:id="7"]',namespaces=NS))
         self.assertNotIn(next(b for b in report['findings'] if b['kind']=='editorial')['paragraph'],report['skipped_paragraphs'])
+    def _long_doc(self, n=6):
+        d=Document();d.add_paragraph('تاریخ:11/06/1404');d.add_paragraph('هدف')
+        for i in range(n):d.add_paragraph('این پاراگراف شماره‌دار آزمایشی ميباشد و متن کافی دارد '+'الف'*i)
+        d.save(self.src)
+    def test_timeout_splits_batch_and_keeps_going(self):
+        from llm_client import LLMRequestError
+        self._long_doc()
+        class Slow(FakeClient):
+            sizes=[]
+            def complete(self,messages):
+                n=len(json.loads(messages[1]['content'])['paragraphs']);Slow.sizes.append(n)
+                if n>2:raise LLMRequestError('Could not reach the internal LLM: The read operation timed out')
+                return super().complete(messages)
+        report=review(self.src,self.root/'out',Slow(),now=NOW,strict_dates=False)
+        self.assertEqual(Slow.sizes,[6,3,1,2,3,1,2])
+        self.assertEqual([f['kind'] for f in report['findings']].count('editorial'),6)
+        self.assertEqual(report['failed_batches'],[])
+    def test_single_paragraph_timeout_is_recorded_not_fatal(self):
+        from llm_client import LLMRequestError
+        self._long_doc(3)
+        class OneBad(FakeClient):
+            def complete(self,messages):
+                paras=json.loads(messages[1]['content'])['paragraphs']
+                if any('الفالف' in p['text'] for p in paras):raise LLMRequestError('timed out')
+                return super().complete(messages)
+        report=review(self.src,self.root/'out',OneBad(),now=NOW,strict_dates=False)
+        self.assertEqual(len(report['failed_batches']),1)
+        self.assertEqual([f['kind'] for f in report['findings']].count('editorial'),2)
+    def test_llm_that_never_answers_aborts_without_output(self):
+        from llm_client import LLMRequestError
+        self._long_doc()
+        class Dead:
+            def complete(self,messages):raise LLMRequestError('timed out')
+        with self.assertRaisesRegex(ValueError,'three times'):review(self.src,self.root/'out',Dead(),now=NOW,strict_dates=False)
+        self.assertFalse((self.root/'out'/self.src.name).exists())
+    def test_batch_size_env(self):
+        import os
+        from editorial_review import batch_chars
+        os.environ['EDITORIAL_BATCH_CHARS']='800'
+        try:self.assertEqual(batch_chars(),800)
+        finally:del os.environ['EDITORIAL_BATCH_CHARS']
+        self.assertEqual(batch_chars(),2500)
     def test_manually_numbered_headings_are_sections(self):
         from editorial_review import blocks_from, bare
         self.assertEqual(bare('۱. هدف'),'هدف');self.assertEqual(bare('5-2 الزامات عمومی'),'الزامات عمومی')
