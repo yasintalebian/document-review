@@ -207,6 +207,9 @@ def main() -> None:
 
     review_parser = subparsers.add_parser("review")
     review_parser.add_argument("--document", required=True)
+    review_parser.add_argument("--mode", choices=["editorial", "consistency"], default="editorial")
+    review_parser.add_argument("--output-dir", help="Separate output directory; editorial mode preserves the input filename")
+    review_parser.add_argument("--publish-outbox", help="Atomically publish the editorial result to the review dashboard")
     review_parser.add_argument("--corpus", default="references")
     review_parser.add_argument("--output", default="artifacts/reviewed_with_track_changes.docx")
     review_parser.add_argument("--report", default="artifacts/consistency_report.json")
@@ -219,6 +222,22 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "promote":
         print(f"Promoted reference: {promote_document(args.document, args.corpus)}")
+        return
+    if args.mode == "editorial":
+        from editorial_review import review, publish
+        import tempfile
+        if args.output_dir:
+            destination = Path(args.output_dir)
+        else:
+            base = Path(args.output).parent
+            base.mkdir(parents=True, exist_ok=True)
+            destination = Path(tempfile.mkdtemp(prefix="editorial-", dir=base))
+        result = review(args.document, destination)
+        print(f"Tracked document: {destination / Path(args.document).name}")
+        print(f"Report: {destination / 'report.json'}")
+        print(f"Changes: {result['summary']['findings_total']}")
+        if args.publish_outbox:
+            print(f"Published: {publish(destination, args.publish_outbox)}")
         return
     report = review_document(args.document, args.corpus, args.output, args.report, args.iso_baseline)
     print(f"Checked {report['finding_count']} paragraph(s) against {report['reference_count']} reference paragraph(s).")
