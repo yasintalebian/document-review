@@ -113,6 +113,8 @@ class Block:
     page: int | None
     page_source: str
     editable: bool
+    anchor: int | None = None   # text-box paragraphs: index of the body paragraph holding the shape
+    report: bool = True         # False for the legacy (VML) duplicate of a text box: revised, not reported twice
 
 
 def safe_paragraph(p):
@@ -153,6 +155,22 @@ def blocks_from(root, page_map=None):
     return result
 
 
+MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+
+
+def textbox_blocks(root, body_blocks):
+    """Paragraphs inside text boxes (cover-page shapes). Word stores each box twice: a DrawingML
+    copy and a VML fallback; both are returned so they stay identical, the fallback marked report=False."""
+    index_of = {b.element: b.index for b in body_blocks}
+    result = []
+    for p in root.xpath('./w:body//w:txbxContent//w:p', namespaces=NS):
+        anchor = next((index_of[a] for a in p.iterancestors() if a in index_of), None)
+        fallback = any(a.tag == MC_FALLBACK for a in p.iterancestors())
+        result.append(Block(len(body_blocks) + len(result), p, text_of(p), 'صفحهٔ عنوان', 1, 'cover_textbox',
+                            safe_paragraph(p), anchor=anchor, report=not fallback))
+    return result
+
+
 def date_edits(root, blocks, today):
     """Locate front-matter fields by labels, never arbitrary dates in body text."""
     by_element = {b.element:b for b in blocks}
@@ -165,11 +183,19 @@ def date_edits(root, blocks, today):
         edits[b.index]=(after,kind)
         found.add(kind)
     # Cover date must have an explicit date label, before body heading, outside tables.
-    body_start=next((b.index for b in blocks if is_body_start(b.text)),len(blocks))
-    for b in blocks:
+    body=[b for b in blocks if b.anchor is None and b.page_source!='cover_textbox']
+    boxes=[b for b in blocks if b.page_source=='cover_textbox']
+    body_start=next((b.index for b in body if is_body_start(b.text)),len(body))
+    label=re.compile(r'^\s*تاریخ\s*[:：]')
+    for b in body:
         if b.index>=body_start: break
-        if b.element.getparent().tag==W+'body' and re.match(r'^\s*تاریخ\s*[:：]',b.text):
+        if b.element.getparent().tag==W+'body' and label.match(b.text):
             update(b.element,'cover_date')
+    if 'cover_date' not in found:
+        # Many templates put the cover date in a text box on the title page.
+        for b in boxes:
+            if b.anchor is not None and b.anchor<body_start and label.match(b.text):
+                update(b.element,'cover_date')
     for table in root.xpath('./w:body/w:tbl',namespaces=NS):
         rows=table.findall(W+'tr')
         before=[]
@@ -300,7 +326,7 @@ def preflight(document_path, now=None):
         problems.append('سند از قبل Track Changes دارد؛ تغییرات را در Word بپذیرید/رد کنید و نسخهٔ تمیز را بگذارید.')
     blocks=blocks_from(document)
     try:
-        _,found=date_edits(document,blocks,now.date())
+        _,found=date_edits(document,blocks+textbox_blocks(document,blocks),now.date())
     except ValueError as exc:
         found=set();problems.append(f'فیلد تاریخ ساختار پشتیبانی‌نشده دارد: {exc}')
     labels={'cover_date':'تاریخ صفحهٔ عنوان','review_date':'تاریخ بازنگری جدول شناسنامه','approval_date':'ستون تاریخ جدول تصویب'}
@@ -324,7 +350,8 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
         if document.xpath('.//w:ins | .//w:del | .//w:moveFrom | .//w:moveTo',namespaces=NS):
             raise ValueError('Input already has tracked changes; supply a clean approved source copy')
         blocks=blocks_from(document,page_map)
-        metadata,found=date_edits(document,blocks,now.date())
+        all_blocks=blocks+textbox_blocks(document,blocks)
+        metadata,found=date_edits(document,all_blocks,now.date())
         missing={'cover_date','review_date','approval_date'}-found
         if strict_dates and missing:raise ValueError('Date fields could not be identified safely: '+', '.join(sorted(missing)))
         # Front matter ends at the first body heading; do not ask LLM to rewrite metadata.
@@ -376,7 +403,7 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
             raise LLMUnavailable('No usable LLM response for any batch; nothing was written. '+failed_batches[0]['error'])
         reasons={'cover_date':'به‌روزرسانی تاریخ صفحهٔ عنوان','review_date':'به‌روزرسانی تاریخ بازنگری در شناسنامهٔ سند','approval_date':'خالی کردن تاریخ تصویب برای بازنگری جدید'}
         changes=[];rid=1
-        for b in blocks:
+        for b in all_blocks:
             if b.index in metadata:
                 after,kind=metadata[b.index];reason=reasons[kind]
             elif b.index in edits:after,reason=edits[b.index];kind='editorial'
@@ -384,10 +411,13 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
             if after==b.text:continue
             rid=revise(b.element,b.text,after,rid,now.isoformat(),
                        whole_date=kind!="editorial" and len(DATE_RE.findall(b.text))==1)
+            if not b.report:continue  # legacy duplicate of a text box: revised identically, reported once
+            in_box=b.page_source=='cover_textbox'
             page_label=(str(b.page)+' (شمارهٔ ذخیره‌شده؛ نیازمند تأیید)') if b.page_source=='cached_layout_estimate' else (str(b.page) if b.page is not None else 'نامشخص؛ نیازمند صفحه‌بندی Word')
             section_label = {'cover_date':'صفحهٔ عنوان','review_date':'شناسنامهٔ سند','approval_date':'جدول تصویب'}.get(kind,b.section)
             changes.append({'paragraph':b.index,'clause':section_label,'page':b.page,'page_source':b.page_source,
-                'location':f'بند «{section_label}»، صفحه {page_label}، پاراگراف {b.index+1}',
+                'location':(f'بند «{section_label}»، صفحه {page_label}، کادر متنی' if in_box else
+                            f'بند «{section_label}»، صفحه {page_label}، پاراگراف {b.index+1}'),
                 'kind':kind,'before':b.text,'after':after,'issue':reason,'recommendation':after,
                 'severity':'low' if kind=='editorial' else 'info','applied':True})
         settings=etree.fromstring(z.read('word/settings.xml'),parser)
