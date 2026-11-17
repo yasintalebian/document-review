@@ -283,6 +283,33 @@ def revise(p, before, after, revision_id, timestamp, whole_date=False):
     return revision_id
 
 
+class LLMUnavailable(ValueError):
+    """The model gave no usable answer; the document itself may be fine. Nothing was written."""
+
+
+def preflight(document_path, now=None):
+    """Check a DOCX without calling the LLM. Returns {'ok', 'problems', 'paragraphs', 'date_fields'}."""
+    source=Path(document_path);problems=[]
+    now=now or datetime.now(ZoneInfo('Asia/Tehran'))
+    try:
+        with zipfile.ZipFile(source) as z:
+            document=etree.fromstring(z.read('word/document.xml'),etree.XMLParser(resolve_entities=False,no_network=True))
+    except (OSError,KeyError,zipfile.BadZipFile,etree.XMLSyntaxError) as exc:
+        return {'ok':False,'problems':[f'فایل Word معتبر نیست: {exc.__class__.__name__}'],'paragraphs':0,'date_fields':[]}
+    if document.xpath('.//w:ins | .//w:del | .//w:moveFrom | .//w:moveTo',namespaces=NS):
+        problems.append('سند از قبل Track Changes دارد؛ تغییرات را در Word بپذیرید/رد کنید و نسخهٔ تمیز را بگذارید.')
+    blocks=blocks_from(document)
+    try:
+        _,found=date_edits(document,blocks,now.date())
+    except ValueError as exc:
+        found=set();problems.append(f'فیلد تاریخ ساختار پشتیبانی‌نشده دارد: {exc}')
+    labels={'cover_date':'تاریخ صفحهٔ عنوان','review_date':'تاریخ بازنگری جدول شناسنامه','approval_date':'ستون تاریخ جدول تصویب'}
+    for key in sorted({'cover_date','review_date','approval_date'}-found):
+        problems.append('پیدا نشد: '+labels[key])
+    editable=sum(1 for b in blocks if b.editable and len(b.text.strip())>12)
+    return {'ok':not problems,'problems':problems,'paragraphs':editable,'date_fields':sorted(found)}
+
+
 def review(document_path, output_dir, client=None, page_map=None, now=None, strict_dates=True):
     source=Path(document_path);dest=Path(output_dir)
     if not source.is_file() or source.suffix.lower()!='.docx':raise ValueError('Input must be a DOCX file')
@@ -329,7 +356,7 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
                     state['llm_failures_in_a_row']+=1
                     failed_batches.append({'batch':label,'paragraphs':[b.index for b in batch],'error':str(exc)[:300]})
                     if state['llm_failures_in_a_row']>=3:
-                        raise ValueError('The LLM did not answer even single paragraphs three times in a row; '
+                        raise LLMUnavailable('The LLM did not answer even single paragraphs three times in a row; '
                                          'nothing was written. Increase INTERNAL_LLM_TIMEOUT_SECONDS. Last error: '+str(exc)[:200]) from exc
                     return
                 try:
@@ -346,7 +373,7 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
         for number,batch in enumerate(batches,1):
             ask(batch,f'{number}/{len(batches)}')
         if batches and not state['ok']:
-            raise ValueError('No usable LLM response for any batch; nothing was written. '+failed_batches[0]['error'])
+            raise LLMUnavailable('No usable LLM response for any batch; nothing was written. '+failed_batches[0]['error'])
         reasons={'cover_date':'به‌روزرسانی تاریخ صفحهٔ عنوان','review_date':'به‌روزرسانی تاریخ بازنگری در شناسنامهٔ سند','approval_date':'خالی کردن تاریخ تصویب برای بازنگری جدید'}
         changes=[];rid=1
         for b in blocks:

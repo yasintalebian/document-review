@@ -1,0 +1,199 @@
+"""Daily editorial review of the approved document library.
+
+Each run (started by a systemd timer on workdays) picks the documents that are due,
+oldest review first, runs the editorial review and publishes each result to the review
+dashboard outbox, where it lands in the default manager's inbox.
+
+* Library: the folder of final, approved DOCX files under their original names
+  (the dashboard writes the clean approved version back here after final approval).
+* Due: never reviewed, or last reviewed more than --interval-days ago (default 365).
+* A document that fails (e.g. date fields not found) is recorded and skipped; it is
+  retried after --retry-days or as soon as the file changes.
+* If the LLM is unavailable the run stops without penalising any document.
+* State lives in a small JSON ledger; runs are serialised with a lock file.
+
+    python scheduled_review.py --check        # validate every library document, no LLM
+    python scheduled_review.py --dry-run      # show what the next run would send
+    python scheduled_review.py                # run (skips Thursday/Friday unless --force)
+"""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timedelta
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("Asia/Tehran")
+WORKDAYS = {5, 6, 0, 1, 2}  # Python weekday(): Sat=5, Sun=6, Mon=0, Tue=1, Wed=2 (Thu/Fri off)
+DEFAULTS = {
+    "library": "/opt/isms-review-center/agent/references",
+    "outbox": "/opt/isms-review-center/agent/outbox",
+    "state": "/opt/document-review/state/scheduled_review.json",
+    "artifacts": "/opt/document-review/artifacts/scheduled",
+}
+
+
+def log(message: str) -> None:
+    print(f"{datetime.now(TZ):%Y-%m-%d %H:%M:%S} {message}", flush=True)
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def library_files(library: Path) -> list[Path]:
+    """DOCX files directly in the library, ignoring Word lock files and hidden temp files."""
+    return sorted(p for p in library.iterdir()
+                  if p.is_file() and p.suffix.lower() == ".docx" and not p.name.startswith((".", "~$")))
+
+
+def load_state(path: Path) -> dict:
+    if not path.exists():
+        return {"documents": {}}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("documents", {})
+    return data
+
+
+def save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".state-", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _when(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+def due_documents(files: list[Path], state: dict, now: datetime, interval_days: int, retry_days: int):
+    """Return (due, waiting) where due is ordered: never reviewed first, then oldest review; ties by name."""
+    due, waiting = [], []
+    for path in files:
+        entry = state["documents"].get(path.name, {})
+        last_review = _when(entry.get("last_published"))
+        last_failure = _when(entry.get("last_failed"))
+        if last_review and now - last_review < timedelta(days=interval_days):
+            waiting.append((path, f"بازنگری بعدی پس از {(last_review + timedelta(days=interval_days)).date()}"))
+            continue
+        changed = entry.get("failed_sha256") and entry["failed_sha256"] != sha256(path)
+        if last_failure and not changed and now - last_failure < timedelta(days=retry_days) \
+                and (not last_review or last_failure > last_review):
+            waiting.append((path, f"خطای قبلی؛ تلاش دوباره پس از {(last_failure + timedelta(days=retry_days)).date()}"))
+            continue
+        due.append(path)
+    due.sort(key=lambda p: (state["documents"].get(p.name, {}).get("last_published") or "", p.name))
+    return due, waiting
+
+
+def run(args, client=None, now: datetime | None = None) -> int:
+    from editorial_review import LLMUnavailable, preflight, publish, review
+
+    now = now or datetime.now(TZ)
+    library, outbox, state_path = Path(args.library), Path(args.outbox), Path(args.state)
+    if not library.is_dir():
+        log(f"ERROR library folder not found: {library}")
+        return 2
+
+    files = library_files(library)
+    if args.check:
+        bad = 0
+        for path in files:
+            result = preflight(path, now)
+            mark = "OK " if result["ok"] else "FIX"
+            bad += not result["ok"]
+            log(f"{mark} {path.name} — {result['paragraphs']} paragraph(s)" +
+                ("" if result["ok"] else " — " + " | ".join(result["problems"])))
+        log(f"{len(files)} document(s), {len(files) - bad} ready, {bad} need fixing")
+        return 1 if bad else 0
+
+    if not args.force and not args.dry_run and now.weekday() not in WORKDAYS:
+        log("Not a workday (Thursday/Friday); nothing sent. Use --force to run anyway.")
+        return 0
+    if not outbox.is_dir():
+        log(f"ERROR outbox folder not found: {outbox}")
+        return 2
+
+    state = load_state(state_path)
+    due, waiting = due_documents(files, state, now, args.interval_days, args.retry_days)
+    log(f"Library: {len(files)} document(s); due: {len(due)}; waiting: {len(waiting)}; sending up to {args.per_run}")
+    if args.dry_run:
+        for path in due[:args.per_run]:
+            log(f"WOULD SEND {path.name}")
+        for path, why in waiting[:20]:
+            log(f"WAIT {path.name} — {why}")
+        return 0
+
+    sent = 0
+    attempts = 0
+    for path in due:
+        if sent >= args.per_run or attempts >= args.per_run + args.max_extra_attempts:
+            break
+        attempts += 1
+        entry = state["documents"].setdefault(path.name, {})
+        digest = sha256(path)
+        run_dir = Path(args.artifacts) / f"{now:%Y%m%d-%H%M%S}-{path.stem}"
+        try:
+            check = preflight(path, now)
+            if not check["ok"]:
+                raise ValueError(" | ".join(check["problems"]))
+            log(f"REVIEW {path.name}")
+            report = review(path, run_dir, client=client, now=now)
+            destination = publish(run_dir, outbox)
+        except LLMUnavailable as exc:
+            log(f"STOP LLM unavailable while reviewing {path.name}: {exc}")
+            save_state(state_path, state)
+            return 3
+        except Exception as exc:  # one bad document must not block the rest of the library
+            entry.update({"last_failed": now.isoformat(), "failed_sha256": digest,
+                          "last_error": str(exc)[:500]})
+            entry["failures"] = entry.get("failures", 0) + 1
+            log(f"FAIL {path.name}: {str(exc)[:300]}")
+            save_state(state_path, state)
+            continue
+        entry.update({"last_published": now.isoformat(), "published_sha256": digest,
+                      "run_id": destination.name, "output_dir": str(run_dir),
+                      "changes": report["summary"]["findings_total"], "last_error": None})
+        sent += 1
+        log(f"SENT {path.name} -> {destination.name} ({report['summary']['findings_total']} change(s))")
+        save_state(state_path, state)
+    log(f"Done: {sent} sent, {attempts - sent} failed")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--library", default=os.getenv("SCHEDULED_REVIEW_LIBRARY", DEFAULTS["library"]))
+    ap.add_argument("--outbox", default=os.getenv("SCHEDULED_REVIEW_OUTBOX", DEFAULTS["outbox"]))
+    ap.add_argument("--state", default=os.getenv("SCHEDULED_REVIEW_STATE", DEFAULTS["state"]))
+    ap.add_argument("--artifacts", default=os.getenv("SCHEDULED_REVIEW_ARTIFACTS", DEFAULTS["artifacts"]))
+    ap.add_argument("--per-run", type=int, default=int(os.getenv("SCHEDULED_REVIEW_PER_RUN", "2")))
+    ap.add_argument("--interval-days", type=int, default=int(os.getenv("SCHEDULED_REVIEW_INTERVAL_DAYS", "365")))
+    ap.add_argument("--retry-days", type=int, default=int(os.getenv("SCHEDULED_REVIEW_RETRY_DAYS", "7")))
+    ap.add_argument("--max-extra-attempts", type=int, default=5,
+                    help="Extra documents to try in one run when some fail")
+    ap.add_argument("--check", action="store_true", help="Validate every library document without the LLM")
+    ap.add_argument("--dry-run", action="store_true", help="Show what would be sent; change nothing")
+    ap.add_argument("--force", action="store_true", help="Run even on Thursday/Friday")
+    args = ap.parse_args()
+
+    lock_path = Path(args.state).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log("Another scheduled review is running; exiting.")
+            return 0
+        return run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

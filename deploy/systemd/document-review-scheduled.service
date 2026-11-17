@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily editorial review of the approved ISMS document library
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/document-review/app
+EnvironmentFile=/opt/document-review/config/document-review.env
+Environment=INTERNAL_LLM_TIMEOUT_SECONDS=300
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/document-review/venv/bin/python /opt/document-review/app/scheduled_review.py
+# A full run with a slow model can take a while; never let it hang forever.
+TimeoutStartSec=4h
+Nice=10
