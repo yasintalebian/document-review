@@ -100,3 +100,52 @@ class SchedulerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NestedLibraryTests(unittest.TestCase):
+    """The real library: references/docs/<one folder per document>/<code>.docx plus PDFs, Excel and lock files."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.library, self.outbox = root / "references", root / "outbox"
+        self.outbox.mkdir()
+        net = self.library / "docs" / "امنیت شبکه"; net.mkdir(parents=True)
+        fixture(net / "SMIA.RG.13.Ver02.6.docx")
+        (net / "SMIA.RG.13.Ver02.6.pdf").write_bytes(b"%PDF")
+        (net / "~$IA.RG.13.Ver02.6.docx").write_bytes(b"lock")
+        hard = self.library / "docs" / "هاردنینگ" / "ویندوز"; hard.mkdir(parents=True)
+        fixture(hard / "SMIA.WI.01.Ver01.00.docx")
+        (self.library / "docs" / "اهداف").mkdir()
+        (self.library / "docs" / "اهداف" / "SMIA.FR.05.Ver04.5.xlsx").write_bytes(b"xlsx")
+        (self.library / "docs" / "اهداف" / "old.doc").write_bytes(b"doc")
+        self.args = Namespace(library=str(self.library), outbox=str(self.outbox), state=str(root / "state.json"),
+                              artifacts=str(root / "artifacts"), per_run=2, interval_days=365, retry_days=7,
+                              max_extra_attempts=5, check=False, dry_run=False, force=False)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_reviews_documents_in_subfolders_and_reports_their_path(self):
+        self.assertEqual(run(self.args, FakeClient(), SATURDAY), 0)
+        manifests = [json.loads((p / "manifest.json").read_text()) for p in self.outbox.iterdir()
+                     if not p.name.startswith(".")]
+        self.assertEqual(sorted(m["library_path"] for m in manifests),
+                         ["docs/امنیت شبکه/SMIA.RG.13.Ver02.6.docx", "docs/هاردنینگ/ویندوز/SMIA.WI.01.Ver01.00.docx"])
+        self.assertEqual(sorted(m["source_filename"] for m in manifests),
+                         ["SMIA.RG.13.Ver02.6.docx", "SMIA.WI.01.Ver01.00.docx"])
+        self.assertEqual(sorted(load_state(Path(self.args.state))["documents"]),
+                         ["docs/امنیت شبکه/SMIA.RG.13.Ver02.6.docx", "docs/هاردنینگ/ویندوز/SMIA.WI.01.Ver01.00.docx"])
+
+    def test_check_lists_skipped_files(self):
+        import io
+        from contextlib import redirect_stdout
+        self.args.check = True
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(run(self.args, FakeClient(), SATURDAY), 0)
+        text = out.getvalue()
+        self.assertIn("OK  docs/امنیت شبکه/SMIA.RG.13.Ver02.6.docx", text)
+        self.assertIn("SKIP 1 .pdf", text); self.assertIn("SKIP 1 .xlsx", text); self.assertIn("SKIP 1 lock/temp", text)
+        self.assertIn("SKIP 1 .doc file(s) — not reviewed: docs/اهداف/old.doc", text)
+        self.assertIn("2 document(s), 2 ready, 0 need fixing", text)

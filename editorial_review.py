@@ -447,7 +447,8 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
 
 
 
-def publish(output_dir, outbox_dir):
+def publish(output_dir, outbox_dir, library_path=None):
+    """Atomically publish a finished review; library_path tells the dashboard where the original lives."""
     source=Path(output_dir);outbox=Path(outbox_dir)
     report=json.loads((source/'report.json').read_text(encoding='utf-8'))
     name=report['output_filename']
@@ -469,6 +470,7 @@ def publish(output_dir, outbox_dir):
                           'sha256':hashlib.sha256(target.read_bytes()).hexdigest()})
         manifest={'schema_version':'1','run_id':run_id,'created_at':datetime.now(ZoneInfo('Asia/Tehran')).isoformat(),
                   'title':Path(name).stem,'source_filename':name,'files':files}
+        if library_path:manifest['library_path']=str(library_path)
         target=tmp/'manifest.json';target.write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         os.chown(target,-1,group);target.chmod(0o640)
         tmp.rename(destination)

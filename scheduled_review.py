@@ -47,10 +47,35 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _skipped_name(path: Path, library: Path) -> bool:
+    rel = path.relative_to(library)
+    return any(part.startswith(".") for part in rel.parts) or path.name.startswith("~$")
+
+
 def library_files(library: Path) -> list[Path]:
-    """DOCX files directly in the library, ignoring Word lock files and hidden temp files."""
-    return sorted(p for p in library.iterdir()
-                  if p.is_file() and p.suffix.lower() == ".docx" and not p.name.startswith((".", "~$")))
+    """Every DOCX in the library, including subfolders (one folder per document is fine).
+
+    Word lock files (~$...), hidden files/folders and non-DOCX files are ignored.
+    Sorted by filename (the document code), then path.
+    """
+    files = [p for p in library.rglob("*")
+             if p.is_file() and p.suffix.lower() == ".docx" and not _skipped_name(p, library)]
+    return sorted(files, key=lambda p: (p.name, str(p)))
+
+
+def ignored_files(library: Path) -> dict[str, list[Path]]:
+    """Files in the library that the review never touches, grouped by extension (for --check)."""
+    groups: dict[str, list[Path]] = {}
+    for p in library.rglob("*"):
+        if not p.is_file() or (p.suffix.lower() == ".docx" and not _skipped_name(p, library)):
+            continue
+        key = "lock/temp" if p.name.startswith("~$") or p.suffix.lower() == ".tmp" else (p.suffix.lower() or "(none)")
+        groups.setdefault(key, []).append(p)
+    return groups
+
+
+def key_of(path: Path, library: Path) -> str:
+    return path.relative_to(library).as_posix()
 
 
 def load_state(path: Path) -> dict:
@@ -73,11 +98,12 @@ def _when(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
-def due_documents(files: list[Path], state: dict, now: datetime, interval_days: int, retry_days: int):
+def due_documents(files: list[Path], state: dict, now: datetime, interval_days: int, retry_days: int,
+                  library: Path):
     """Return (due, waiting) where due is ordered: never reviewed first, then oldest review; ties by name."""
     due, waiting = [], []
     for path in files:
-        entry = state["documents"].get(path.name, {})
+        entry = state["documents"].get(key_of(path, library), {})
         last_review = _when(entry.get("last_published"))
         last_failure = _when(entry.get("last_failed"))
         if last_review and now - last_review < timedelta(days=interval_days):
@@ -89,7 +115,7 @@ def due_documents(files: list[Path], state: dict, now: datetime, interval_days: 
             waiting.append((path, f"خطای قبلی؛ تلاش دوباره پس از {(last_failure + timedelta(days=retry_days)).date()}"))
             continue
         due.append(path)
-    due.sort(key=lambda p: (state["documents"].get(p.name, {}).get("last_published") or "", p.name))
+    due.sort(key=lambda p: (state["documents"].get(key_of(p, library), {}).get("last_published") or "", p.name, str(p)))
     return due, waiting
 
 
@@ -109,8 +135,17 @@ def run(args, client=None, now: datetime | None = None) -> int:
             result = preflight(path, now)
             mark = "OK " if result["ok"] else "FIX"
             bad += not result["ok"]
-            log(f"{mark} {path.name} — {result['paragraphs']} paragraph(s)" +
+            log(f"{mark} {key_of(path, library)} — {result['paragraphs']} paragraph(s)" +
                 ("" if result["ok"] else " — " + " | ".join(result["problems"])))
+        names = {}
+        for path in files:
+            names.setdefault(path.name, []).append(key_of(path, library))
+        for name, paths in names.items():
+            if len(paths) > 1:
+                log(f"NOTE same filename in {len(paths)} places (each is reviewed separately): " + " ; ".join(paths))
+        for kind, paths in sorted(ignored_files(library).items()):
+            log(f"SKIP {len(paths)} {kind} file(s) — not reviewed" +
+                (": " + " ; ".join(key_of(p, library) for p in paths) if kind == ".doc" else ""))
         log(f"{len(files)} document(s), {len(files) - bad} ready, {bad} need fixing")
         return 1 if bad else 0
 
@@ -122,13 +157,13 @@ def run(args, client=None, now: datetime | None = None) -> int:
         return 2
 
     state = load_state(state_path)
-    due, waiting = due_documents(files, state, now, args.interval_days, args.retry_days)
+    due, waiting = due_documents(files, state, now, args.interval_days, args.retry_days, library)
     log(f"Library: {len(files)} document(s); due: {len(due)}; waiting: {len(waiting)}; sending up to {args.per_run}")
     if args.dry_run:
         for path in due[:args.per_run]:
-            log(f"WOULD SEND {path.name}")
+            log(f"WOULD SEND {key_of(path, library)}")
         for path, why in waiting[:20]:
-            log(f"WAIT {path.name} — {why}")
+            log(f"WAIT {key_of(path, library)} — {why}")
         return 0
 
     sent = 0
@@ -137,32 +172,33 @@ def run(args, client=None, now: datetime | None = None) -> int:
         if sent >= args.per_run or attempts >= args.per_run + args.max_extra_attempts:
             break
         attempts += 1
-        entry = state["documents"].setdefault(path.name, {})
+        key = key_of(path, library)
+        entry = state["documents"].setdefault(key, {})
         digest = sha256(path)
         run_dir = Path(args.artifacts) / f"{now:%Y%m%d-%H%M%S}-{path.stem}"
         try:
             check = preflight(path, now)
             if not check["ok"]:
                 raise ValueError(" | ".join(check["problems"]))
-            log(f"REVIEW {path.name}")
+            log(f"REVIEW {key}")
             report = review(path, run_dir, client=client, now=now)
-            destination = publish(run_dir, outbox)
+            destination = publish(run_dir, outbox, library_path=key)
         except LLMUnavailable as exc:
-            log(f"STOP LLM unavailable while reviewing {path.name}: {exc}")
+            log(f"STOP LLM unavailable while reviewing {key}: {exc}")
             save_state(state_path, state)
             return 3
         except Exception as exc:  # one bad document must not block the rest of the library
             entry.update({"last_failed": now.isoformat(), "failed_sha256": digest,
                           "last_error": str(exc)[:500]})
             entry["failures"] = entry.get("failures", 0) + 1
-            log(f"FAIL {path.name}: {str(exc)[:300]}")
+            log(f"FAIL {key}: {str(exc)[:300]}")
             save_state(state_path, state)
             continue
         entry.update({"last_published": now.isoformat(), "published_sha256": digest,
                       "run_id": destination.name, "output_dir": str(run_dir),
                       "changes": report["summary"]["findings_total"], "last_error": None})
         sent += 1
-        log(f"SENT {path.name} -> {destination.name} ({report['summary']['findings_total']} change(s))")
+        log(f"SENT {key} -> {destination.name} ({report['summary']['findings_total']} change(s))")
         save_state(state_path, state)
     log(f"Done: {sent} sent, {attempts - sent} failed")
     return 0
