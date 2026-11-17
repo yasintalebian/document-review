@@ -26,7 +26,7 @@ class SchedulerTests(unittest.TestCase):
             fixture(self.library / f"{name}.docx")
         (self.library / "~$SMIA.RG.01.Ver1.0.docx").write_bytes(b"word lock file")
         self.args = Namespace(library=str(self.library), outbox=str(self.outbox), state=str(root / "state.json"),
-                              artifacts=str(root / "artifacts"), per_run=2, interval_days=365, retry_days=7,
+                              artifacts=str(root / "artifacts"), rules=str(root / "rules.txt"), per_run=2, interval_days=365, retry_days=7,
                               max_extra_attempts=5, check=False, dry_run=False, force=False)
 
     def tearDown(self):
@@ -127,7 +127,7 @@ class NestedLibraryTests(unittest.TestCase):
         (self.library / "docs" / "اهداف" / "SMIA.FR.05.Ver04.5.xlsx").write_bytes(b"xlsx")
         (self.library / "docs" / "اهداف" / "old.doc").write_bytes(b"doc")
         self.args = Namespace(library=str(self.library), outbox=str(self.outbox), state=str(root / "state.json"),
-                              artifacts=str(root / "artifacts"), per_run=2, interval_days=365, retry_days=7,
+                              artifacts=str(root / "artifacts"), rules=str(root / "rules.txt"), per_run=2, interval_days=365, retry_days=7,
                               max_extra_attempts=5, check=False, dry_run=False, force=False)
 
     def tearDown(self):
@@ -156,3 +156,59 @@ class NestedLibraryTests(unittest.TestCase):
         self.assertIn("SKIP 1 .pdf", text); self.assertIn("SKIP 1 .xlsx", text); self.assertIn("SKIP 1 lock/temp", text)
         self.assertIn("SKIP 1 .doc file(s) — not reviewed: docs/اهداف/old.doc", text)
         self.assertIn("2 document(s), 2 ready, 0 need fixing", text)
+
+
+class RulesTests(unittest.TestCase):
+    """exclude: never reviewed. editorial-only: spelling/grammar only, dates untouched (e.g. NDAs)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.library, self.outbox = root / "references", root / "outbox"
+        self.outbox.mkdir()
+        nda = self.library / "docs" / "NDA-همکاران"; nda.mkdir(parents=True)
+        for name in ("SMIA.CR.01.Ver1.3.docx", "SMIA.CR.01.Ver1.3.docx-نسخهHR.docx"):
+            d = Document(); d.add_paragraph("قرارداد عدم افشا"); d.add_paragraph("این قرارداد بین طرفین منعقد ميباشد و معتبر است.")
+            d.save(nda / name)
+        (self.library / "docs" / "مانور").mkdir()
+        d = Document(); d.add_paragraph("یادداشت"); d.save(self.library / "docs" / "مانور" / "مانورها.docx")
+        d = Document(); d.add_paragraph("نکته"); d.save(self.library / "docs" / "نکات.docx")
+        self.rules = root / "rules.txt"
+        self.rules.write_text("# test rules\nexclude docs/نکات.docx\nexclude docs/مانور/*.docx\n"
+                              "editorial-only docs/NDA-همکاران/*.docx\nexclude docs/missing.docx\n", encoding="utf-8")
+        self.args = Namespace(library=str(self.library), outbox=str(self.outbox), state=str(root / "state.json"),
+                              artifacts=str(root / "artifacts"), rules=str(self.rules), per_run=2, interval_days=365,
+                              retry_days=7, max_extra_attempts=5, check=False, dry_run=False, force=False)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_check_reports_rules(self):
+        import io
+        from contextlib import redirect_stdout
+        self.args.check = True
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(run(self.args, FakeClient(), SATURDAY), 0)
+        text = out.getvalue()
+        self.assertIn("OK  docs/NDA-همکاران/SMIA.CR.01.Ver1.3.docx — 2 paragraph(s) (editorial only, dates unchanged)", text)
+        self.assertIn("EXCLUDED docs/نکات.docx", text); self.assertIn("EXCLUDED docs/مانور/مانورها.docx", text)
+        self.assertIn("WARNING rule matches no document: exclude docs/missing.docx", text)
+        self.assertIn("2 document(s), 2 ready, 0 need fixing, 2 excluded", text)
+
+    def test_editorial_only_documents_are_reviewed_without_dates_and_excluded_never(self):
+        run(self.args, FakeClient(), SATURDAY)
+        run(self.args, FakeClient(), SATURDAY + timedelta(days=1))
+        manifests = [json.loads((p / "manifest.json").read_text()) for p in self.outbox.iterdir()
+                     if not p.name.startswith(".")]
+        self.assertEqual(sorted(m["source_filename"] for m in manifests),
+                         ["SMIA.CR.01.Ver1.3.docx", "SMIA.CR.01.Ver1.3.docx-نسخهHR.docx"])
+        for p in self.outbox.iterdir():
+            report = json.loads((p / "report.json").read_text())
+            self.assertFalse(report["dates_updated"])
+            self.assertEqual({f["kind"] for f in report["findings"]}, {"editorial"})
+        self.assertFalse(any("نکات" in k or "مانور" in k for k in load_state(Path(self.args.state))["documents"]))
+
+    def test_bad_rules_file_stops_with_error(self):
+        self.rules.write_text("skip docs/x.docx\n", encoding="utf-8")
+        self.assertEqual(run(self.args, FakeClient(), SATURDAY), 2)

@@ -313,8 +313,10 @@ class LLMUnavailable(ValueError):
     """The model gave no usable answer; the document itself may be fine. Nothing was written."""
 
 
-def preflight(document_path, now=None):
-    """Check a DOCX without calling the LLM. Returns {'ok', 'problems', 'paragraphs', 'date_fields'}."""
+def preflight(document_path, now=None, update_dates=True):
+    """Check a DOCX without calling the LLM. Returns {'ok', 'problems', 'paragraphs', 'date_fields'}.
+
+    With update_dates=False (editorial-only documents such as contracts) date fields are not required."""
     source=Path(document_path);problems=[]
     now=now or datetime.now(ZoneInfo('Asia/Tehran'))
     try:
@@ -325,18 +327,21 @@ def preflight(document_path, now=None):
     if document.xpath('.//w:ins | .//w:del | .//w:moveFrom | .//w:moveTo',namespaces=NS):
         problems.append('سند از قبل Track Changes دارد؛ تغییرات را در Word بپذیرید/رد کنید و نسخهٔ تمیز را بگذارید.')
     blocks=blocks_from(document)
-    try:
-        _,found=date_edits(document,blocks+textbox_blocks(document,blocks),now.date())
-    except ValueError as exc:
-        found=set();problems.append(f'فیلد تاریخ ساختار پشتیبانی‌نشده دارد: {exc}')
-    labels={'cover_date':'تاریخ صفحهٔ عنوان','review_date':'تاریخ بازنگری جدول شناسنامه','approval_date':'ستون تاریخ جدول تصویب'}
-    for key in sorted({'cover_date','review_date','approval_date'}-found):
-        problems.append('پیدا نشد: '+labels[key])
+    found=set()
+    if update_dates:
+        try:
+            _,found=date_edits(document,blocks+textbox_blocks(document,blocks),now.date())
+        except ValueError as exc:
+            problems.append(f'فیلد تاریخ ساختار پشتیبانی‌نشده دارد: {exc}')
+        labels={'cover_date':'تاریخ صفحهٔ عنوان','review_date':'تاریخ بازنگری جدول شناسنامه','approval_date':'ستون تاریخ جدول تصویب'}
+        for key in sorted({'cover_date','review_date','approval_date'}-found):
+            problems.append('پیدا نشد: '+labels[key])
     editable=sum(1 for b in blocks if b.editable and len(b.text.strip())>12)
     return {'ok':not problems,'problems':problems,'paragraphs':editable,'date_fields':sorted(found)}
 
 
-def review(document_path, output_dir, client=None, page_map=None, now=None, strict_dates=True):
+def review(document_path, output_dir, client=None, page_map=None, now=None, strict_dates=True, update_dates=True):
+    """Editorial review. update_dates=False: spelling/grammar only, no date field is touched."""
     source=Path(document_path);dest=Path(output_dir)
     if not source.is_file() or source.suffix.lower()!='.docx':raise ValueError('Input must be a DOCX file')
     output=dest/source.name
@@ -351,8 +356,11 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
             raise ValueError('Input already has tracked changes; supply a clean approved source copy')
         blocks=blocks_from(document,page_map)
         all_blocks=blocks+textbox_blocks(document,blocks)
-        metadata,found=date_edits(document,all_blocks,now.date())
-        missing={'cover_date','review_date','approval_date'}-found
+        if update_dates:
+            metadata,found=date_edits(document,all_blocks,now.date())
+            missing={'cover_date','review_date','approval_date'}-found
+        else:
+            metadata,found,missing={},set(),set()
         if strict_dates and missing:raise ValueError('Date fields could not be identified safely: '+', '.join(sorted(missing)))
         # Front matter ends at the first body heading; do not ask LLM to rewrite metadata.
         start=next((b.index for b in blocks if is_body_start(b.text)),0)
@@ -467,7 +475,9 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
         'output_filename':source.name,'summary':{'findings_total':len(changes),'recommendation':'اصلاحات پیشنهادی را در Word با نمایش All Markup بررسی کنید.'},
         'findings':changes,'warnings':warnings,'skipped_paragraphs':skipped,'date_fields_found':sorted(found),
         'rejected_suggestions':rejected,'failed_batches':failed_batches,
-        'approval_date_note':'تاریخ تصویب در نمای نهایی خالی است؛ مقدار قبلی فقط در حذف ردیابی‌شده برای ممیزی باقی می‌ماند.'}
+        'dates_updated':update_dates,
+        'approval_date_note':('تاریخ تصویب در نمای نهایی خالی است؛ مقدار قبلی فقط در حذف ردیابی‌شده برای ممیزی باقی می‌ماند.'
+                              if update_dates else 'این سند فقط بازنگری نگارشی شد؛ هیچ تاریخی تغییر نکرد.')}
     (dest/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     lines=[f'گزارش بازنگری نگارشی: {source.name}',f'زمان: {now.isoformat()}',f'تعداد اصلاحات: {len(changes)}','']
     for c in changes:lines.extend([c['location'],c['issue'],'قبل: '+c['before'],'بعد: '+(c['after'] or '(خالی)'), ''])
@@ -516,13 +526,15 @@ def main():
     ap.add_argument('--publish-outbox', help='Publish the completed output to the dashboard outbox')
     ap.add_argument('--page-map',help='JSON with source_sha256 and paragraphs keyed by zero-based index, each with text_sha256 and page')
     ap.add_argument('--allow-missing-date-fields',action='store_true',help='Explicitly allow unknown date fields; warnings are recorded')
+    ap.add_argument('--no-date-update',action='store_true',help='Editorial review only; leave every date unchanged')
     args=ap.parse_args()
     mapping=None
     if args.page_map:
         payload=json.loads(Path(args.page_map).read_text())
         if payload.get('source_sha256')!=hashlib.sha256(Path(args.document).read_bytes()).hexdigest():raise ValueError('Page map is for another document')
         mapping=payload['paragraphs']
-    report=review(args.document,args.output_dir,page_map=mapping,strict_dates=not args.allow_missing_date_fields)
+    report=review(args.document,args.output_dir,page_map=mapping,strict_dates=not args.allow_missing_date_fields,
+                  update_dates=not args.no_date_update)
     print('Output:',Path(args.output_dir)/Path(args.document).name)
     print('Changes:',report['summary']['findings_total'])
     print('Report:',Path(args.output_dir)/'report.json')

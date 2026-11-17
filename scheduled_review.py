@@ -36,7 +36,9 @@ DEFAULTS = {
     "outbox": "/opt/isms-review-center/agent/outbox",
     "state": "/opt/document-review/state/scheduled_review.json",
     "artifacts": "/opt/document-review/artifacts/scheduled",
+    "rules": "/opt/document-review/config/scheduled_review_rules.txt",
 }
+RULE_KINDS = ("exclude", "editorial-only")
 
 
 def log(message: str) -> None:
@@ -76,6 +78,33 @@ def ignored_files(library: Path) -> dict[str, list[Path]]:
 
 def key_of(path: Path, library: Path) -> str:
     return path.relative_to(library).as_posix()
+
+
+def load_rules(path: Path) -> list[tuple[str, str]]:
+    """Read '<kind> <relative path or glob>' lines; kinds: exclude, editorial-only. '#' starts a comment.
+
+        exclude         docs/نکات.docx
+        editorial-only  docs/NDA-همکاران/*.docx
+    """
+    if not path.exists():
+        return []
+    rules = []
+    for number, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        kind, _, pattern = line.partition(" ")
+        pattern = pattern.strip()
+        if kind not in RULE_KINDS or not pattern:
+            raise ValueError(f"{path}:{number}: expected '<exclude|editorial-only> <path>', got {raw!r}")
+        rules.append((kind, pattern))
+    return rules
+
+
+def rule_for(key: str, rules: list[tuple[str, str]]) -> str | None:
+    """First rule whose pattern matches the document's library path (glob, case-sensitive)."""
+    from fnmatch import fnmatchcase
+    return next((kind for kind, pattern in rules if fnmatchcase(key, pattern)), None)
 
 
 def load_state(path: Path) -> dict:
@@ -128,15 +157,31 @@ def run(args, client=None, now: datetime | None = None) -> int:
         log(f"ERROR library folder not found: {library}")
         return 2
 
-    files = library_files(library)
+    try:
+        rules = load_rules(Path(args.rules))
+    except ValueError as exc:
+        log(f"ERROR {exc}")
+        return 2
+    all_files = library_files(library)
+    kinds = {p: rule_for(key_of(p, library), rules) for p in all_files}
+    excluded = [p for p in all_files if kinds[p] == "exclude"]
+    files = [p for p in all_files if kinds[p] != "exclude"]
+    editorial_only = {p for p in files if kinds[p] == "editorial-only"}
     if args.check:
         bad = 0
         for path in files:
-            result = preflight(path, now)
+            result = preflight(path, now, update_dates=path not in editorial_only)
             mark = "OK " if result["ok"] else "FIX"
             bad += not result["ok"]
-            log(f"{mark} {key_of(path, library)} — {result['paragraphs']} paragraph(s)" +
+            note = " (editorial only, dates unchanged)" if path in editorial_only else ""
+            log(f"{mark} {key_of(path, library)} — {result['paragraphs']} paragraph(s){note}" +
                 ("" if result["ok"] else " — " + " | ".join(result["problems"])))
+        for path in excluded:
+            log(f"EXCLUDED {key_of(path, library)}")
+        from fnmatch import fnmatchcase
+        for kind, pattern in rules:
+            if not any(fnmatchcase(key_of(p, library), pattern) for p in all_files):
+                log(f"WARNING rule matches no document: {kind} {pattern}")
         names = {}
         for path in files:
             names.setdefault(path.name, []).append(key_of(path, library))
@@ -146,7 +191,7 @@ def run(args, client=None, now: datetime | None = None) -> int:
         for kind, paths in sorted(ignored_files(library).items()):
             log(f"SKIP {len(paths)} {kind} file(s) — not reviewed" +
                 (": " + " ; ".join(key_of(p, library) for p in paths) if kind == ".doc" else ""))
-        log(f"{len(files)} document(s), {len(files) - bad} ready, {bad} need fixing")
+        log(f"{len(files)} document(s), {len(files) - bad} ready, {bad} need fixing, {len(excluded)} excluded")
         return 1 if bad else 0
 
     if not args.force and not args.dry_run and now.weekday() not in WORKDAYS:
@@ -176,7 +221,7 @@ def run(args, client=None, now: datetime | None = None) -> int:
         entry = state["documents"].setdefault(key, {})
         digest = sha256(path)
         run_dir = Path(args.artifacts) / f"{now:%Y%m%d-%H%M%S}-{path.stem}"
-        check = preflight(path, now)
+        check = preflight(path, now, update_dates=path not in editorial_only)
         if not check["ok"]:
             # Cheap (no LLM) and expected for documents that need fixing: does not use up the run's attempts.
             entry.update({"last_failed": now.isoformat(), "failed_sha256": digest,
@@ -189,7 +234,7 @@ def run(args, client=None, now: datetime | None = None) -> int:
         attempts += 1
         try:
             log(f"REVIEW {key}")
-            report = review(path, run_dir, client=client, now=now)
+            report = review(path, run_dir, client=client, now=now, update_dates=path not in editorial_only)
             destination = publish(run_dir, outbox, library_path=key)
         except LLMUnavailable as exc:
             log(f"STOP LLM unavailable while reviewing {key}: {exc}")
@@ -218,6 +263,8 @@ def main() -> int:
     ap.add_argument("--outbox", default=os.getenv("SCHEDULED_REVIEW_OUTBOX", DEFAULTS["outbox"]))
     ap.add_argument("--state", default=os.getenv("SCHEDULED_REVIEW_STATE", DEFAULTS["state"]))
     ap.add_argument("--artifacts", default=os.getenv("SCHEDULED_REVIEW_ARTIFACTS", DEFAULTS["artifacts"]))
+    ap.add_argument("--rules", default=os.getenv("SCHEDULED_REVIEW_RULES", DEFAULTS["rules"]),
+                    help="Rules file: 'exclude <path>' / 'editorial-only <path>' lines (globs allowed)")
     ap.add_argument("--per-run", type=int, default=int(os.getenv("SCHEDULED_REVIEW_PER_RUN", "2")))
     ap.add_argument("--interval-days", type=int, default=int(os.getenv("SCHEDULED_REVIEW_INTERVAL_DAYS", "365")))
     ap.add_argument("--retry-days", type=int, default=int(os.getenv("SCHEDULED_REVIEW_RETRY_DAYS", "7")))
