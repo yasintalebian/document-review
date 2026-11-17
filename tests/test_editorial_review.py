@@ -221,3 +221,72 @@ class EditorialTests(unittest.TestCase):
         self.assertEqual(rejected,original)
 
     def test_jalali_date(self):self.assertEqual(jalali(2026,11,16),(1405,8,25))
+
+
+TEXTBOX_RUN = '''<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+  xmlns:v="urn:schemas-microsoft-com:vml">
+ <mc:AlternateContent>
+  <mc:Choice Requires="wps"><w:drawing><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">
+   <wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:align>left</wp:align></wp:positionH>
+   <wp:positionV relativeFrom="paragraph"><wp:posOffset>6271895</wp:posOffset></wp:positionV>
+   <wp:extent cx="1800000" cy="400000"/><wp:wrapNone/><wp:docPr id="7" name="Text Box 7"/>
+   <a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp>
+    <wps:txbx><w:txbxContent><w:p><w:r><w:rPr><w:rtl/></w:rPr><w:t xml:space="preserve">تاریخ:‏ 08/04/1404</w:t></w:r></w:p></w:txbxContent></wps:txbx>
+   </wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice>
+  <mc:Fallback><w:pict><v:rect><v:textbox><w:txbxContent><w:p><w:r><w:rPr><w:rtl/></w:rPr><w:t xml:space="preserve">تاریخ:‏ 08/04/1404</w:t></w:r></w:p></w:txbxContent></v:textbox></v:rect></w:pict></mc:Fallback>
+ </mc:AlternateContent>
+</w:r>'''
+
+
+def textbox_fixture(path):
+    """Same template as fixture(), but the cover date sits in a text box (DrawingML + VML fallback)."""
+    fixture(path)
+    root = xml(path)
+    body = root.find(W + 'body')
+    cover = next(p for p in body.findall(W + 'p') if ''.join(p.xpath('.//w:t/text()', namespaces=NS)).startswith('تاریخ:'))
+    anchor = cover.getprevious()
+    body.remove(cover)
+    anchor.append(etree.fromstring(TEXTBOX_RUN))
+    tmp = path.with_name('tmp-' + path.name)
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, 'w') as zout:
+        for e in zin.infolist():
+            zout.writestr(e, etree.tostring(root) if e.filename == 'word/document.xml' else zin.read(e.filename))
+    tmp.replace(path)
+
+
+class TextBoxCoverDateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name)
+        self.src = self.root / 'SMIA.RG.12.Ver04.1.docx'; textbox_fixture(self.src)
+    def tearDown(self): self.temp.cleanup()
+
+    def test_preflight_finds_cover_date_in_text_box(self):
+        from editorial_review import preflight
+        result = preflight(self.src, NOW)
+        self.assertTrue(result['ok'], result['problems'])
+        self.assertIn('cover_date', result['date_fields'])
+
+    def test_both_text_box_copies_updated_and_reported_once(self):
+        report = review(self.src, self.root / 'out', FakeClient(), now=NOW)
+        out = xml(self.root / 'out' / self.src.name)
+        boxes = out.xpath('.//w:txbxContent', namespaces=NS)
+        self.assertEqual(len(boxes), 2)
+        for box in boxes:
+            self.assertEqual(accepted(box), 'تاریخ:‏ 25/08/1405')
+            self.assertEqual(''.join(box.xpath('.//w:delText/text()', namespaces=NS)), '08/04/1404')
+            self.assertTrue(box.xpath('.//w:ins', namespaces=NS))
+        cover = [f for f in report['findings'] if f['kind'] == 'cover_date']
+        self.assertEqual(len(cover), 1)
+        self.assertIn('کادر متنی', cover[0]['location'])
+        self.assertEqual(report['summary']['findings_total'], 4)
+
+    def test_body_cover_date_still_preferred(self):
+        report = review(self._body(), self.root / 'out2', FakeClient(), now=NOW)
+        self.assertNotIn('کادر متنی', next(f for f in report['findings'] if f['kind'] == 'cover_date')['location'])
+
+    def _body(self):
+        p = self.root / 'SMIA.RG.17.Ver2.05.docx'; fixture(p); return p

@@ -113,6 +113,8 @@ class Block:
     page: int | None
     page_source: str
     editable: bool
+    anchor: int | None = None   # text-box paragraphs: index of the body paragraph holding the shape
+    report: bool = True         # False for the legacy (VML) duplicate of a text box: revised, not reported twice
 
 
 def safe_paragraph(p):
@@ -153,6 +155,22 @@ def blocks_from(root, page_map=None):
     return result
 
 
+MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+
+
+def textbox_blocks(root, body_blocks):
+    """Paragraphs inside text boxes (cover-page shapes). Word stores each box twice: a DrawingML
+    copy and a VML fallback; both are returned so they stay identical, the fallback marked report=False."""
+    index_of = {b.element: b.index for b in body_blocks}
+    result = []
+    for p in root.xpath('./w:body//w:txbxContent//w:p', namespaces=NS):
+        anchor = next((index_of[a] for a in p.iterancestors() if a in index_of), None)
+        fallback = any(a.tag == MC_FALLBACK for a in p.iterancestors())
+        result.append(Block(len(body_blocks) + len(result), p, text_of(p), 'صفحهٔ عنوان', 1, 'cover_textbox',
+                            safe_paragraph(p), anchor=anchor, report=not fallback))
+    return result
+
+
 def date_edits(root, blocks, today):
     """Locate front-matter fields by labels, never arbitrary dates in body text."""
     by_element = {b.element:b for b in blocks}
@@ -165,11 +183,19 @@ def date_edits(root, blocks, today):
         edits[b.index]=(after,kind)
         found.add(kind)
     # Cover date must have an explicit date label, before body heading, outside tables.
-    body_start=next((b.index for b in blocks if is_body_start(b.text)),len(blocks))
-    for b in blocks:
+    body=[b for b in blocks if b.anchor is None and b.page_source!='cover_textbox']
+    boxes=[b for b in blocks if b.page_source=='cover_textbox']
+    body_start=next((b.index for b in body if is_body_start(b.text)),len(body))
+    label=re.compile(r'^\s*تاریخ\s*[:：]')
+    for b in body:
         if b.index>=body_start: break
-        if b.element.getparent().tag==W+'body' and re.match(r'^\s*تاریخ\s*[:：]',b.text):
+        if b.element.getparent().tag==W+'body' and label.match(b.text):
             update(b.element,'cover_date')
+    if 'cover_date' not in found:
+        # Many templates put the cover date in a text box on the title page.
+        for b in boxes:
+            if b.anchor is not None and b.anchor<body_start and label.match(b.text):
+                update(b.element,'cover_date')
     for table in root.xpath('./w:body/w:tbl',namespaces=NS):
         rows=table.findall(W+'tr')
         before=[]
@@ -283,7 +309,39 @@ def revise(p, before, after, revision_id, timestamp, whole_date=False):
     return revision_id
 
 
-def review(document_path, output_dir, client=None, page_map=None, now=None, strict_dates=True):
+class LLMUnavailable(ValueError):
+    """The model gave no usable answer; the document itself may be fine. Nothing was written."""
+
+
+def preflight(document_path, now=None, update_dates=True):
+    """Check a DOCX without calling the LLM. Returns {'ok', 'problems', 'paragraphs', 'date_fields'}.
+
+    With update_dates=False (editorial-only documents such as contracts) date fields are not required."""
+    source=Path(document_path);problems=[]
+    now=now or datetime.now(ZoneInfo('Asia/Tehran'))
+    try:
+        with zipfile.ZipFile(source) as z:
+            document=etree.fromstring(z.read('word/document.xml'),etree.XMLParser(resolve_entities=False,no_network=True))
+    except (OSError,KeyError,zipfile.BadZipFile,etree.XMLSyntaxError) as exc:
+        return {'ok':False,'problems':[f'فایل Word معتبر نیست: {exc.__class__.__name__}'],'paragraphs':0,'date_fields':[]}
+    if document.xpath('.//w:ins | .//w:del | .//w:moveFrom | .//w:moveTo',namespaces=NS):
+        problems.append('سند از قبل Track Changes دارد؛ تغییرات را در Word بپذیرید/رد کنید و نسخهٔ تمیز را بگذارید.')
+    blocks=blocks_from(document)
+    found=set()
+    if update_dates:
+        try:
+            _,found=date_edits(document,blocks+textbox_blocks(document,blocks),now.date())
+        except ValueError as exc:
+            problems.append(f'فیلد تاریخ ساختار پشتیبانی‌نشده دارد: {exc}')
+        labels={'cover_date':'تاریخ صفحهٔ عنوان','review_date':'تاریخ بازنگری جدول شناسنامه','approval_date':'ستون تاریخ جدول تصویب'}
+        for key in sorted({'cover_date','review_date','approval_date'}-found):
+            problems.append('پیدا نشد: '+labels[key])
+    editable=sum(1 for b in blocks if b.editable and len(b.text.strip())>12)
+    return {'ok':not problems,'problems':problems,'paragraphs':editable,'date_fields':sorted(found)}
+
+
+def review(document_path, output_dir, client=None, page_map=None, now=None, strict_dates=True, update_dates=True):
+    """Editorial review. update_dates=False: spelling/grammar only, no date field is touched."""
     source=Path(document_path);dest=Path(output_dir)
     if not source.is_file() or source.suffix.lower()!='.docx':raise ValueError('Input must be a DOCX file')
     output=dest/source.name
@@ -297,8 +355,12 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
         if document.xpath('.//w:ins | .//w:del | .//w:moveFrom | .//w:moveTo',namespaces=NS):
             raise ValueError('Input already has tracked changes; supply a clean approved source copy')
         blocks=blocks_from(document,page_map)
-        metadata,found=date_edits(document,blocks,now.date())
-        missing={'cover_date','review_date','approval_date'}-found
+        all_blocks=blocks+textbox_blocks(document,blocks)
+        if update_dates:
+            metadata,found=date_edits(document,all_blocks,now.date())
+            missing={'cover_date','review_date','approval_date'}-found
+        else:
+            metadata,found,missing={},set(),set()
         if strict_dates and missing:raise ValueError('Date fields could not be identified safely: '+', '.join(sorted(missing)))
         # Front matter ends at the first body heading; do not ask LLM to rewrite metadata.
         start=next((b.index for b in blocks if is_body_start(b.text)),0)
@@ -329,7 +391,7 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
                     state['llm_failures_in_a_row']+=1
                     failed_batches.append({'batch':label,'paragraphs':[b.index for b in batch],'error':str(exc)[:300]})
                     if state['llm_failures_in_a_row']>=3:
-                        raise ValueError('The LLM did not answer even single paragraphs three times in a row; '
+                        raise LLMUnavailable('The LLM did not answer even single paragraphs three times in a row; '
                                          'nothing was written. Increase INTERNAL_LLM_TIMEOUT_SECONDS. Last error: '+str(exc)[:200]) from exc
                     return
                 try:
@@ -346,10 +408,10 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
         for number,batch in enumerate(batches,1):
             ask(batch,f'{number}/{len(batches)}')
         if batches and not state['ok']:
-            raise ValueError('No usable LLM response for any batch; nothing was written. '+failed_batches[0]['error'])
+            raise LLMUnavailable('No usable LLM response for any batch; nothing was written. '+failed_batches[0]['error'])
         reasons={'cover_date':'به‌روزرسانی تاریخ صفحهٔ عنوان','review_date':'به‌روزرسانی تاریخ بازنگری در شناسنامهٔ سند','approval_date':'خالی کردن تاریخ تصویب برای بازنگری جدید'}
         changes=[];rid=1
-        for b in blocks:
+        for b in all_blocks:
             if b.index in metadata:
                 after,kind=metadata[b.index];reason=reasons[kind]
             elif b.index in edits:after,reason=edits[b.index];kind='editorial'
@@ -357,10 +419,13 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
             if after==b.text:continue
             rid=revise(b.element,b.text,after,rid,now.isoformat(),
                        whole_date=kind!="editorial" and len(DATE_RE.findall(b.text))==1)
+            if not b.report:continue  # legacy duplicate of a text box: revised identically, reported once
+            in_box=b.page_source=='cover_textbox'
             page_label=(str(b.page)+' (شمارهٔ ذخیره‌شده؛ نیازمند تأیید)') if b.page_source=='cached_layout_estimate' else (str(b.page) if b.page is not None else 'نامشخص؛ نیازمند صفحه‌بندی Word')
             section_label = {'cover_date':'صفحهٔ عنوان','review_date':'شناسنامهٔ سند','approval_date':'جدول تصویب'}.get(kind,b.section)
             changes.append({'paragraph':b.index,'clause':section_label,'page':b.page,'page_source':b.page_source,
-                'location':f'بند «{section_label}»، صفحه {page_label}، پاراگراف {b.index+1}',
+                'location':(f'بند «{section_label}»، صفحه {page_label}، کادر متنی' if in_box else
+                            f'بند «{section_label}»، صفحه {page_label}، پاراگراف {b.index+1}'),
                 'kind':kind,'before':b.text,'after':after,'issue':reason,'recommendation':after,
                 'severity':'low' if kind=='editorial' else 'info','applied':True})
         settings=etree.fromstring(z.read('word/settings.xml'),parser)
@@ -410,7 +475,9 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
         'output_filename':source.name,'summary':{'findings_total':len(changes),'recommendation':'اصلاحات پیشنهادی را در Word با نمایش All Markup بررسی کنید.'},
         'findings':changes,'warnings':warnings,'skipped_paragraphs':skipped,'date_fields_found':sorted(found),
         'rejected_suggestions':rejected,'failed_batches':failed_batches,
-        'approval_date_note':'تاریخ تصویب در نمای نهایی خالی است؛ مقدار قبلی فقط در حذف ردیابی‌شده برای ممیزی باقی می‌ماند.'}
+        'dates_updated':update_dates,
+        'approval_date_note':('تاریخ تصویب در نمای نهایی خالی است؛ مقدار قبلی فقط در حذف ردیابی‌شده برای ممیزی باقی می‌ماند.'
+                              if update_dates else 'این سند فقط بازنگری نگارشی شد؛ هیچ تاریخی تغییر نکرد.')}
     (dest/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     lines=[f'گزارش بازنگری نگارشی: {source.name}',f'زمان: {now.isoformat()}',f'تعداد اصلاحات: {len(changes)}','']
     for c in changes:lines.extend([c['location'],c['issue'],'قبل: '+c['before'],'بعد: '+(c['after'] or '(خالی)'), ''])
@@ -420,7 +487,8 @@ def review(document_path, output_dir, client=None, page_map=None, now=None, stri
 
 
 
-def publish(output_dir, outbox_dir):
+def publish(output_dir, outbox_dir, library_path=None):
+    """Atomically publish a finished review; library_path tells the dashboard where the original lives."""
     source=Path(output_dir);outbox=Path(outbox_dir)
     report=json.loads((source/'report.json').read_text(encoding='utf-8'))
     name=report['output_filename']
@@ -442,6 +510,7 @@ def publish(output_dir, outbox_dir):
                           'sha256':hashlib.sha256(target.read_bytes()).hexdigest()})
         manifest={'schema_version':'1','run_id':run_id,'created_at':datetime.now(ZoneInfo('Asia/Tehran')).isoformat(),
                   'title':Path(name).stem,'source_filename':name,'files':files}
+        if library_path:manifest['library_path']=str(library_path)
         target=tmp/'manifest.json';target.write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         os.chown(target,-1,group);target.chmod(0o640)
         tmp.rename(destination)
@@ -457,13 +526,15 @@ def main():
     ap.add_argument('--publish-outbox', help='Publish the completed output to the dashboard outbox')
     ap.add_argument('--page-map',help='JSON with source_sha256 and paragraphs keyed by zero-based index, each with text_sha256 and page')
     ap.add_argument('--allow-missing-date-fields',action='store_true',help='Explicitly allow unknown date fields; warnings are recorded')
+    ap.add_argument('--no-date-update',action='store_true',help='Editorial review only; leave every date unchanged')
     args=ap.parse_args()
     mapping=None
     if args.page_map:
         payload=json.loads(Path(args.page_map).read_text())
         if payload.get('source_sha256')!=hashlib.sha256(Path(args.document).read_bytes()).hexdigest():raise ValueError('Page map is for another document')
         mapping=payload['paragraphs']
-    report=review(args.document,args.output_dir,page_map=mapping,strict_dates=not args.allow_missing_date_fields)
+    report=review(args.document,args.output_dir,page_map=mapping,strict_dates=not args.allow_missing_date_fields,
+                  update_dates=not args.no_date_update)
     print('Output:',Path(args.output_dir)/Path(args.document).name)
     print('Changes:',report['summary']['findings_total'])
     print('Report:',Path(args.output_dir)/'report.json')
