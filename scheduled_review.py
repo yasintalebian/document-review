@@ -167,19 +167,27 @@ def run(args, client=None, now: datetime | None = None) -> int:
         return 0
 
     sent = 0
+    skipped = 0
     attempts = 0
     for path in due:
         if sent >= args.per_run or attempts >= args.per_run + args.max_extra_attempts:
             break
-        attempts += 1
         key = key_of(path, library)
         entry = state["documents"].setdefault(key, {})
         digest = sha256(path)
         run_dir = Path(args.artifacts) / f"{now:%Y%m%d-%H%M%S}-{path.stem}"
+        check = preflight(path, now)
+        if not check["ok"]:
+            # Cheap (no LLM) and expected for documents that need fixing: does not use up the run's attempts.
+            entry.update({"last_failed": now.isoformat(), "failed_sha256": digest,
+                          "last_error": " | ".join(check["problems"])[:500]})
+            entry["failures"] = entry.get("failures", 0) + 1
+            skipped += 1
+            log(f"SKIP {key}: {' | '.join(check['problems'])[:300]}")
+            save_state(state_path, state)
+            continue
+        attempts += 1
         try:
-            check = preflight(path, now)
-            if not check["ok"]:
-                raise ValueError(" | ".join(check["problems"]))
             log(f"REVIEW {key}")
             report = review(path, run_dir, client=client, now=now)
             destination = publish(run_dir, outbox, library_path=key)
@@ -200,7 +208,7 @@ def run(args, client=None, now: datetime | None = None) -> int:
         sent += 1
         log(f"SENT {key} -> {destination.name} ({report['summary']['findings_total']} change(s))")
         save_state(state_path, state)
-    log(f"Done: {sent} sent, {attempts - sent} failed")
+    log(f"Done: {sent} sent, {attempts - sent} failed, {skipped} skipped (need fixing)")
     return 0
 
 

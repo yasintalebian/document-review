@@ -78,6 +78,13 @@ class SchedulerTests(unittest.TestCase):
         run(self.args, FakeClient(), SATURDAY + timedelta(days=2))
         self.assertIn("SMIA.RG.00.Ver1.0.docx", self.packages())
 
+    def test_many_broken_documents_do_not_reduce_daily_quota(self):
+        for i in range(7):
+            d = Document(); d.add_paragraph("بدون قالب"); d.save(self.library / f"AAA.broken.{i}.docx")
+        run(self.args, FakeClient(), SATURDAY)
+        self.assertEqual(len(self.packages()), 2)
+        self.assertEqual(sum(1 for k, e in self.state().items() if k.startswith("AAA") and e.get("failures")), 7)
+
     def test_llm_outage_stops_without_blaming_documents(self):
         from llm_client import LLMRequestError
 
