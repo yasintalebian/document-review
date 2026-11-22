@@ -18,17 +18,21 @@ UNRELATED = "پشتیبان‌گیری از پایگاه داده باید رو�
 
 class RequirementClient(FakeClient):
     """Copy-edits like FakeClient; with requirements it raises 13 -> 14 citing the clause; answers gap checks."""
-    def __init__(self, new_number="14"):
+    def __init__(self, new_number="14", gap_text="لازم است پشتیبان‌گیری روزانه انجام و در محل امن نگهداری شود."):
         self.new_number = new_number
+        self.gap_text = gap_text
         self.gap_calls = 0
 
     def complete(self, messages):
         if messages[0]["content"] == GAP_SYSTEM:
             self.gap_calls += 1
             data = json.loads(messages[1]["content"])
-            first = data["candidates"][0]["requirement_id"]
-            return json.dumps({"gaps": [{"requirement_id": first, "issue": "روال پشتیبان‌گیری در سند نیامده است",
-                                         "recommendation": "بندی دربارهٔ پشتیبان‌گیری روزانه افزوده شود"}]},
+            cand = next((c for c in data["candidates"] if "پشتیبان" in c["clause"]), None)
+            if cand is None or not cand["closest_paragraphs"]:
+                return json.dumps({"gaps": []})
+            anchor = cand["closest_paragraphs"][-1]["paragraph_id"]
+            return json.dumps({"gaps": [{"requirement_id": cand["requirement_id"], "issue": "روال پشتیبان‌گیری در سند نیامده است",
+                                         "text": self.gap_text, "insert_after": anchor}]},
                               ensure_ascii=False)
         data = json.loads(messages[1]["content"])
         reqs = data.get("requirements") or []
@@ -109,20 +113,40 @@ class RequirementsTests(unittest.TestCase):
         self.assertIn("حداقل 13 کاراکتر", accepted(xml(self.root / "out" / self.src.name)))
         self.assertTrue(any("در الزام" in r["reason_rejected"] for r in report["rejected_suggestions"]))
 
-    def test_gaps_reported_not_inserted(self):
-        clauses, _ = load(self.reqdir)
-        # Make the unrelated clause relevant to the document so it becomes a gap candidate.
+    def _gap_setup(self):
         (self.reqdir / "backup.txt").write_text("در متن آزمایشی حداقل یک روال پشتیبان‌گیری روزانه لازم است.",
                                                 encoding="utf-8")
         clauses, _ = load(self.reqdir)
+        return clauses
+
+    def test_missing_requirement_is_inserted_as_tracked_paragraph(self):
+        clauses = self._gap_setup()
         client = RequirementClient()
         before_paragraphs = len(xml(self.src).xpath('.//w:p', namespaces=NS))
         report = review(self.src, self.root / "out", client, now=NOW, requirements=clauses)
         gaps = [f for f in report["findings"] if f["kind"] == "requirement_gap"]
         self.assertEqual(client.gap_calls, 1)
-        self.assertEqual(len(gaps), 1); self.assertFalse(gaps[0]["applied"])
+        self.assertEqual(len(gaps), 1); self.assertTrue(gaps[0]["applied"])
+        self.assertIn("پاراگراف جدید", gaps[0]["location"])
+        out = xml(self.root / "out" / self.src.name)
+        self.assertEqual(len(out.xpath('.//w:p', namespaces=NS)), before_paragraphs + 1)
+        new_p = [p for p in out.xpath('.//w:p', namespaces=NS) if "پشتیبان‌گیری روزانه" in "".join(p.itertext())][0]
+        self.assertTrue(new_p.xpath('./w:pPr/w:rPr/w:ins', namespaces=NS))  # paragraph mark is tracked
+        self.assertTrue(new_p.xpath('./w:ins/w:r/w:t', namespaces=NS))       # text is tracked
+        self.assertFalse(new_p.xpath('.//w:sectPr', namespaces=NS))
+        self.assertIn("پشتیبان‌گیری روزانه", accepted(out))
+        self.assertEqual(report["summary"]["requirement_gaps_added"], 1)
+        self.assertIn("افزوده شد:", (self.root / "out" / "report.txt").read_text(encoding="utf-8"))
+
+    def test_gap_with_invented_number_is_only_reported(self):
+        clauses = self._gap_setup()
+        client = RequirementClient(gap_text="لازم است پشتیبان‌گیری هر 6 ساعت انجام و در محل امن نگهداری شود.")
+        before_paragraphs = len(xml(self.src).xpath('.//w:p', namespaces=NS))
+        report = review(self.src, self.root / "out", client, now=NOW, requirements=clauses)
+        gap = [f for f in report["findings"] if f["kind"] == "requirement_gap"][0]
+        self.assertFalse(gap["applied"]); self.assertIn("در الزام نیامده", gap["not_applied_reason"])
         self.assertEqual(len(xml(self.root / "out" / self.src.name).xpath('.//w:p', namespaces=NS)), before_paragraphs)
-        self.assertIn("پیشنهاد:", (self.root / "out" / "report.txt").read_text(encoding="utf-8"))
+        self.assertIn("افزوده نشد", (self.root / "out" / "report.txt").read_text(encoding="utf-8"))
 
     def test_no_requirements_means_no_extra_calls(self):
         client = RequirementClient()
