@@ -62,6 +62,34 @@ class RequirementsTests(unittest.TestCase):
         best = Index(clauses).rank("حداقل 13 کاراکتر کلمه عبور لازم است", limit=1)
         self.assertEqual(best[0].source, "afta.docx")
 
+    def test_synonyms_and_context_find_the_right_clause(self):
+        from requirements_corpus import Clause
+        clauses = [Clause("R1", "afta.pdf", "برای کاربران عادی یک گذرواژه حداقل باید ۸ کاراکتر و برای مدیران حداقل ۱۳ کاراکتر باشد."),
+                   Clause("R2", "afta.pdf", "انقضای سیستمی گذرواژه‌ها برای مدیران یک ماه و برای کاربران عادی سه ماه باشد."),
+                   Clause("R3", "afta.pdf", "قفل شدن حساب کاربری پس از سه بار تلاش ناموفق برای ورود به سامانه."),
+                   Clause("R4", "afta.pdf", "اهداف: حفاظت از نام کاربری و گذرواژه در سطح کاربر و سامانه‌های مرتبط.")]
+        index = Index(clauses)
+        heading = "الزامات مرتبط با شناسه‌های کاربری سطح ادمین مشخصات کلمه عبور راهبر سامانه"
+        length = index.scored("لازم است حداقل 8 کاراکتر باشد.", 1, min_score=1.0, context=heading)
+        self.assertEqual(length[0][1].id, "R1")
+        expiry = index.scored("زمان انقضای کلمه عبور حداکثر شش ماه در نظر گرفته شود.", 1, min_score=1.0, context=heading)
+        self.assertEqual(expiry[0][1].id, "R2")
+
+    def test_scanned_pdf_uses_ocr_text(self):
+        from pypdf import PdfWriter
+        w = PdfWriter(); w.add_blank_page(595, 842)
+        with open(self.reqdir / "afta-scan.pdf", "wb") as fh:
+            w.write(fh)
+        _, warnings = load(self.reqdir)
+        self.assertTrue(any("afta-scan.pdf" in x and "OCR" in x for x in warnings))
+        (self.reqdir / "afta-scan.pdf.ocr.txt").write_text(
+            "حداقل طول گذرواژه در سامانه‌ها باید ۱۳ کاراکتر باشد.", encoding="utf-8")
+        clauses, warnings = load(self.reqdir)
+        self.assertEqual(warnings, [])
+        scan = [c for c in clauses if c.source == "afta-scan.pdf"]
+        self.assertEqual(len(scan), 1); self.assertIn("۱۳", scan[0].text)
+        self.assertNotIn("afta-scan.pdf.ocr.txt", {c.source for c in clauses})
+
     def test_requirement_edit_applied_in_place_and_cited(self):
         clauses, _ = load(self.reqdir)
         client = RequirementClient()
