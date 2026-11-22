@@ -37,6 +37,7 @@ DEFAULTS = {
     "state": "/opt/document-review/state/scheduled_review.json",
     "artifacts": "/opt/document-review/artifacts/scheduled",
     "rules": "/opt/document-review/config/scheduled_review_rules.txt",
+    "requirements": "/opt/isms-review-center/agent/requirements",
 }
 RULE_KINDS = ("exclude", "editorial-only")
 
@@ -128,12 +129,13 @@ def _when(value: str | None) -> datetime | None:
 
 
 def due_documents(files: list[Path], state: dict, now: datetime, interval_days: int, retry_days: int,
-                  library: Path):
+                  library: Path, panel_reviews: dict | None = None):
     """Return (due, waiting) where due is ordered: never reviewed first, then oldest review; ties by name."""
     due, waiting = [], []
     for path in files:
         entry = state["documents"].get(key_of(path, library), {})
-        last_review = _when(entry.get("last_published"))
+        reviewed = [v for v in (entry.get("last_published"), (panel_reviews or {}).get(key_of(path, library))) if v]
+        last_review = max(_when(v) for v in reviewed) if reviewed else None
         last_failure = _when(entry.get("last_failed"))
         if last_review and now - last_review < timedelta(days=interval_days):
             waiting.append((path, f"بازنگری بعدی پس از {(last_review + timedelta(days=interval_days)).date()}"))
@@ -144,7 +146,8 @@ def due_documents(files: list[Path], state: dict, now: datetime, interval_days: 
             waiting.append((path, f"خطای قبلی؛ تلاش دوباره پس از {(last_failure + timedelta(days=retry_days)).date()}"))
             continue
         due.append(path)
-    due.sort(key=lambda p: (state["documents"].get(key_of(p, library), {}).get("last_published") or "", p.name, str(p)))
+    due.sort(key=lambda p: (max(state["documents"].get(key_of(p, library), {}).get("last_published") or "",
+                                (panel_reviews or {}).get(key_of(p, library)) or ""), p.name, str(p)))
     return due, waiting
 
 
@@ -202,7 +205,9 @@ def run(args, client=None, now: datetime | None = None) -> int:
         return 2
 
     state = load_state(state_path)
-    due, waiting = due_documents(files, state, now, args.interval_days, args.retry_days, library)
+    panel_path = Path(args.state).with_name("request_reviews.json")  # written by request_review.py
+    panel_reviews = json.loads(panel_path.read_text(encoding="utf-8")) if panel_path.exists() else {}
+    due, waiting = due_documents(files, state, now, args.interval_days, args.retry_days, library, panel_reviews)
     log(f"Library: {len(files)} document(s); due: {len(due)}; waiting: {len(waiting)}; sending up to {args.per_run}")
     if args.dry_run:
         for path in due[:args.per_run]:
@@ -213,6 +218,12 @@ def run(args, client=None, now: datetime | None = None) -> int:
 
     sent = 0
     skipped = 0
+    from requirements_corpus import load as load_requirements
+    clauses, req_warnings = load_requirements(getattr(args, "requirements", None))
+    if clauses:
+        log(f"Requirements: {len(clauses)} clause(s) from {len({c.source for c in clauses})} document(s)")
+    for warning in req_warnings:
+        log(f"WARNING {warning}")
     attempts = 0
     for path in due:
         if sent >= args.per_run or attempts >= args.per_run + args.max_extra_attempts:
@@ -234,7 +245,8 @@ def run(args, client=None, now: datetime | None = None) -> int:
         attempts += 1
         try:
             log(f"REVIEW {key}")
-            report = review(path, run_dir, client=client, now=now, update_dates=path not in editorial_only)
+            report = review(path, run_dir, client=client, now=now, update_dates=path not in editorial_only,
+                            requirements=clauses, requirement_warnings=req_warnings)
             destination = publish(run_dir, outbox, library_path=key)
         except LLMUnavailable as exc:
             log(f"STOP LLM unavailable while reviewing {key}: {exc}")
@@ -263,6 +275,8 @@ def main() -> int:
     ap.add_argument("--outbox", default=os.getenv("SCHEDULED_REVIEW_OUTBOX", DEFAULTS["outbox"]))
     ap.add_argument("--state", default=os.getenv("SCHEDULED_REVIEW_STATE", DEFAULTS["state"]))
     ap.add_argument("--artifacts", default=os.getenv("SCHEDULED_REVIEW_ARTIFACTS", DEFAULTS["artifacts"]))
+    ap.add_argument("--requirements", default=os.getenv("SCHEDULED_REVIEW_REQUIREMENTS", DEFAULTS["requirements"]),
+                    help="Folder of requirements documents taken into account by every review")
     ap.add_argument("--rules", default=os.getenv("SCHEDULED_REVIEW_RULES", DEFAULTS["rules"]),
                     help="Rules file: 'exclude <path>' / 'editorial-only <path>' lines (globs allowed)")
     ap.add_argument("--per-run", type=int, default=int(os.getenv("SCHEDULED_REVIEW_PER_RUN", "2")))

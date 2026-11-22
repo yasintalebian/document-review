@@ -1,0 +1,9 @@
+[Unit]
+Description=Start the review as soon as the panel uploads a document
+
+[Path]
+PathChanged=/opt/isms-review-center/agent/requests
+Unit=document-review-requests.service
+
+[Install]
+WantedBy=paths.target

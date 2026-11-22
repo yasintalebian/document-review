@@ -1,0 +1,13 @@
+[Unit]
+Description=Review documents uploaded in the ISMS review panel
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/document-review/app
+EnvironmentFile=/opt/document-review/config/document-review.env
+Environment=INTERNAL_LLM_TIMEOUT_SECONDS=300
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/document-review/venv/bin/python /opt/document-review/app/request_review.py
+TimeoutStartSec=4h
