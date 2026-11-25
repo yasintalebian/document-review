@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the ISMS editorial review on workdays (Sat-Wed) at 08:00 Tehran time
+
+[Timer]
+OnCalendar=Sat,Sun,Mon,Tue,Wed *-*-* 08:00:00 Asia/Tehran
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

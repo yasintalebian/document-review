@@ -1,0 +1,10 @@
+[Unit]
+Description=Fallback: pick up panel uploads missed by the path trigger or queued after an LLM outage
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+Unit=document-review-requests.service
+
+[Install]
+WantedBy=timers.target
