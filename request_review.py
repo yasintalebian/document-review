@@ -134,7 +134,8 @@ def process(folder: Path, args, client=None, clauses=(), req_warnings=(), now=No
     log(f"REVIEW {folder.name} ({req['mode']}) {req['filename']}")
     try:
         report = review(path, run_dir, client=client, now=now, update_dates=update_dates,
-                        requirements=list(clauses), requirement_warnings=list(req_warnings))
+                        requirements=list(clauses), requirement_warnings=list(req_warnings),
+                        title=req.get("title") or None)
         destination = publish(run_dir, args.outbox, library_path=req.get("library_path") or None,
                               extra={"review_mode": req["mode"], "request_id": folder.name, "title": req.get("title")})
     except LLMUnavailable as exc:

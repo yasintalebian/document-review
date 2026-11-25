@@ -24,7 +24,7 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 import tempfile
 from zoneinfo import ZoneInfo
@@ -41,6 +41,13 @@ DEFAULTS = {
 }
 RULE_KINDS = ("exclude", "editorial-only")
 
+
+
+def document_title(key: str) -> str:
+    """The document's real name: its library folder (docs/<name>/<code>.docx), else the file name."""
+    path = PurePosixPath(key)
+    parent = path.parent.name
+    return parent if parent and parent != "docs" and path.parent != PurePosixPath(".") else path.stem
 
 def log(message: str) -> None:
     print(f"{datetime.now(TZ):%Y-%m-%d %H:%M:%S} {message}", flush=True)
@@ -246,7 +253,7 @@ def run(args, client=None, now: datetime | None = None) -> int:
         try:
             log(f"REVIEW {key}")
             report = review(path, run_dir, client=client, now=now, update_dates=path not in editorial_only,
-                            requirements=clauses, requirement_warnings=req_warnings)
+                            requirements=clauses, requirement_warnings=req_warnings, title=document_title(key))
             destination = publish(run_dir, outbox, library_path=key)
         except LLMUnavailable as exc:
             log(f"STOP LLM unavailable while reviewing {key}: {exc}")

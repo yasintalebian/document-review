@@ -8,7 +8,7 @@ import unittest
 
 from docx import Document
 
-from editorial_review import GAP_SYSTEM, review
+from editorial_review import APPLICABILITY_SYSTEM, GAP_SYSTEM, review
 from requirements_corpus import Index, load
 from tests.test_editorial_review import NOW, NS, FakeClient, accepted, fixture, xml
 
@@ -18,12 +18,25 @@ UNRELATED = "پشتیبان‌گیری از پایگاه داده باید رو�
 
 class RequirementClient(FakeClient):
     """Copy-edits like FakeClient; with requirements it raises 13 -> 14 citing the clause; answers gap checks."""
-    def __init__(self, new_number="14", gap_text="لازم است پشتیبان‌گیری روزانه انجام و در محل امن نگهداری شود."):
+    def __init__(self, new_number="14", gap_text="لازم است پشتیبان‌گیری روزانه انجام و در محل امن نگهداری شود.",
+                 applies=None, broken_check=False):
         self.new_number = new_number
         self.gap_text = gap_text
+        self.applies = applies          # None: every requirement document applies; else the set that does
+        self.broken_check = broken_check
         self.gap_calls = 0
+        self.checks = []
 
     def complete(self, messages):
+        if messages[0]["content"] == APPLICABILITY_SYSTEM:
+            data = json.loads(messages[1]["content"])
+            self.checks.append(data)
+            if self.broken_check:
+                return "not json"
+            return json.dumps({"document_subject": "خط‌مشی کلمه عبور", "requirements": [
+                {"source": r["source"], "applies": self.applies is None or r["source"] in self.applies,
+                 "reason": "موضوع یکسان" if self.applies is None or r["source"] in self.applies else "موضوع دیگری دارد"}
+                for r in data["requirement_documents"]]}, ensure_ascii=False)
         if messages[0]["content"] == GAP_SYSTEM:
             self.gap_calls += 1
             data = json.loads(messages[1]["content"])
@@ -147,6 +160,36 @@ class RequirementsTests(unittest.TestCase):
         self.assertFalse(gap["applied"]); self.assertIn("در الزام نیامده", gap["not_applied_reason"])
         self.assertEqual(len(xml(self.root / "out" / self.src.name).xpath('.//w:p', namespaces=NS)), before_paragraphs)
         self.assertIn("افزوده نشد", (self.root / "out" / "report.txt").read_text(encoding="utf-8"))
+
+    def test_unrelated_requirement_document_is_not_used(self):
+        clauses = self._gap_setup()
+        client = RequirementClient(applies=set())  # nothing concerns this document
+        report = review(self.src, self.root / "out", client, now=NOW, requirements=clauses, title="خط مشی پشتیبان‌گیری")
+        self.assertIn("حداقل 13 کاراکتر", accepted(xml(self.root / "out" / self.src.name)))
+        self.assertEqual(client.gap_calls, 0)
+        self.assertFalse([f for f in report["findings"] if f["kind"].startswith("requirement")])
+        self.assertEqual(report["requirements_used"], [])
+        self.assertTrue(all(not c["applies"] for c in report["requirement_applicability"]))
+        self.assertEqual(client.checks[0]["document"]["title"], "خط مشی پشتیبان‌گیری")
+        self.assertIn("نامرتبط با این سند", (self.root / "out" / "report.txt").read_text(encoding="utf-8"))
+
+    def test_only_the_related_requirement_document_is_used(self):
+        clauses = self._gap_setup()
+        client = RequirementClient(applies={"afta.docx"})
+        report = review(self.src, self.root / "out", client, now=NOW, requirements=clauses)
+        self.assertEqual(report["requirements_used"], ["afta.docx"])
+        self.assertEqual(report["summary"]["requirement_changes"], 1)
+        self.assertFalse([f for f in report["findings"] if f["kind"] == "requirement_gap"])  # backup.txt skipped
+        self.assertEqual(report["document_subject"], "خط‌مشی کلمه عبور")
+
+    def test_failed_applicability_check_uses_no_requirement(self):
+        clauses = self._gap_setup()
+        client = RequirementClient(broken_check=True)
+        report = review(self.src, self.root / "out", client, now=NOW, requirements=clauses)
+        self.assertEqual(len(client.checks), 2)  # asked twice
+        self.assertEqual(report["requirements_used"], []); self.assertEqual(client.gap_calls, 0)
+        self.assertIn("حداقل 13 کاراکتر", accepted(xml(self.root / "out" / self.src.name)))
+        self.assertTrue(any("هیچ الزامی اعمال نشد" in w for w in report["warnings"]))
 
     def test_no_requirements_means_no_extra_calls(self):
         client = RequirementClient()
